@@ -1,0 +1,49 @@
+name: Build Launcher
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: 生成版本号与 version.h
+        id: ver
+        shell: bash
+        run: |
+          BASE=$(tr -d ' \t\r\n' < VERSION)
+          [ -z "$BASE" ] && BASE=0.1
+          TAG="v${BASE}.${GITHUB_RUN_NUMBER}"
+          A=${BASE%%.*}; B=${BASE#*.}
+          printf '#pragma once\n#define VER_FILE %s,%s,0,%s\n#define VER_STR "%s"\n#define LAUNCHER_VER_W L"%s"\n' \
+            "$A" "$B" "$GITHUB_RUN_NUMBER" "$TAG" "$TAG" > src/version.h
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "版本: $TAG"
+
+      - name: 编译（MSVC /MT 静态 CRT）
+        shell: cmd
+        run: |
+          if not exist build mkdir build
+          if not exist dist mkdir dist
+          rc /nologo /fo build\res.res src\res.rc
+          cl /nologo /W3 /O1 /GL /Gy /Gw /MT /EHs-c- /GR- /DUNICODE /D_UNICODE /D_WIN32_WINNT=0x0A00 src\main.cpp build\res.res /Fe:dist\Launcher-x64.exe /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS user32.lib gdi32.lib shell32.lib comdlg32.lib
+
+      - name: 打 tag 并发布 Release
+        shell: bash
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+          gh release create "$TAG" "dist/Launcher-x64.exe" --title "Launcher $TAG" --notes "自动构建 @ $GITHUB_SHA"

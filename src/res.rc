@@ -1,0 +1,27 @@
+#include <windows.h>
+#include "version.h"
+
+1 ICON "app.ico"
+1 24 "app.manifest"
+
+1 VERSIONINFO
+FILEVERSION    VER_FILE
+PRODUCTVERSION VER_FILE
+FILEOS         0x40004L
+FILETYPE       0x1L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "FileDescription",  "快速启动面板"
+      VALUE "FileVersion",      VER_STR
+      VALUE "ProductName",      "Launcher"
+      VALUE "ProductVersion",   VER_STR
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0804, 1200
+  END
+END
