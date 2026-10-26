@@ -81,7 +81,7 @@
 
 ## 项目实况：Windows 启动面板（windowTAG）
 
-纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘 + GDI+（系统 gdiplus.dll）抗锯齿圆角，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。视觉：米白轻拟物（胶囊标签、浮起卡片、内凹输入框、窗口/弹窗 AnimateWindow 淡入淡出），配色集中在 main.cpp 顶部 C_* 常量，设计语言与 kaozb/app 同源。
+纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘 + GDI+（系统 gdiplus.dll）抗锯齿圆角，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。视觉：米白轻拟物（胶囊标签、浮起卡片、内凹输入框、窗口/弹窗 layered alpha 淡入淡出），配色集中在 main.cpp 顶部 C_* 常量，设计语言与 kaozb/app 同源。注意：EDIT 背景必须返回实心刷（HOLLOW 刷走 PatBlt 会整块变黑）；淡入淡出必须手动 layered alpha（AnimateWindow 增删 WS_EX_LAYERED 会闪系统老边框）。
 
 ### 环境
 

@@ -85,7 +85,7 @@ static std::vector<RECT>   g_dlgEdits;
 static HWND g_hHK = nullptr;         // 热键对话框（编辑对话框句柄见 g_hDlg）
 // GDI 资源
 static HFONT g_fUi, g_fUiB, g_fSmall, g_fGlyph, g_fTitle;
-static HBRUSH g_brBg, g_brCard;
+static HBRUSH g_brBg, g_brCard, g_brInset;
 static HDC g_memDC = nullptr; static HBITMAP g_memBmp = nullptr, g_memOld = nullptr;
 static int g_memW = 0, g_memH = 0;
 static ULONG_PTR g_gdipToken;
@@ -324,17 +324,41 @@ static void ApplyPin() {
                  0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
+// 手动 layered alpha 淡入淡出：AnimateWindow 临时增删 WS_EX_LAYERED 会触发 NC 重排，
+// 偶尔闪出一帧系统老边框；直接操纵 alpha 无此副作用（短 Sleep 在显示/隐藏场景无感）
+static void FadeIn(HWND h, int ms) {
+    if (!IsWindowVisible(h)) {
+        SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) | WS_EX_LAYERED);
+        SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
+        ShowWindow(h, SW_SHOW);
+    }
+    for (int i = 1; i <= 8; i++) {
+        SetLayeredWindowAttributes(h, 0, (BYTE)(255 * i / 8), LWA_ALPHA);
+        Sleep(ms / 8);
+    }
+    SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+}
+
+static void FadeOut(HWND h, int ms) {
+    if (!IsWindowVisible(h)) return;
+    SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) | WS_EX_LAYERED);
+    for (int i = 7; i >= 0; i--) {
+        SetLayeredWindowAttributes(h, 0, (BYTE)(255 * i / 8), LWA_ALPHA);
+        Sleep(ms / 8);
+    }
+    ShowWindow(h, SW_HIDE);
+    SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+}
+
 static void ShowWin() {
-    if (!IsWindowVisible(g_hwnd) && !AnimateWindow(g_hwnd, 140, AW_BLEND))
-        ShowWindow(g_hwnd, SW_SHOW);                      // 动画不支持时回落
+    FadeIn(g_hwnd, 140);
     ClampToWorkArea();
     SetForegroundWindow(g_hwnd);
 }
 
 static void HideWin() {
     SaveWinPos();
-    if (IsWindowVisible(g_hwnd) && !AnimateWindow(g_hwnd, 120, AW_HIDE | AW_BLEND))
-        ShowWindow(g_hwnd, SW_HIDE);
+    FadeOut(g_hwnd, 120);
 }
 static void ToggleWin() { IsWindowVisible(g_hwnd) ? HideWin() : ShowWin(); }
 
@@ -364,8 +388,9 @@ static void MakeFonts() {
 }
 
 static void CreateGdiRes() {
-    g_brBg   = CreateSolidBrush(C_BG);
-    g_brCard = CreateSolidBrush(C_CARD);
+    g_brBg    = CreateSolidBrush(C_BG);
+    g_brCard  = CreateSolidBrush(C_CARD);
+    g_brInset = CreateSolidBrush(C_INSET);
 }
 
 static void FreeMemDC() {
@@ -538,10 +563,11 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                             px, py, S(48), S(18), h, nullptr, inst, nullptr);
         };
         auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id) -> HWND {
+            g_dlgEdits.push_back({ px, py, px + pw, py + S(28) });   // 外圈：父窗口画圆角底+描边
             HWND c = CreateWindowExW(0, L"EDIT", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                     px, py, pw, S(28), h, (HMENU)(INT_PTR)id, inst, nullptr);
+                                     px + S(2), py + S(2), pw - S(4), S(28) - S(4),
+                                     h, (HMENU)(INT_PTR)id, inst, nullptr);
             SendMessageW(c, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(8), S(8)));
-            g_dlgEdits.push_back({ px, py, px + pw, py + S(28) });
             return c;
         };
         auto btn = [&](int px, int py, int pw, int id, const wchar_t* txt, bool pri) {
@@ -574,14 +600,13 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         EndPaint(h, &ps);
         return 0;
     }
-    case WM_PRINTCLIENT:
-        DrawDlgFace(h, (HDC)w);
-        return 0;
+    case WM_NCACTIVATE:
+        return DefWindowProcW(h, m, w, -1);
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w;
         SetBkColor(dc, C_INSET); SetTextColor(dc, C_TEXT);
         SelectObject(dc, g_fUi);
-        return (LRESULT)GetStockObject(HOLLOW_BRUSH);     // 背景由父窗口画圆角底
+        return (LRESULT)g_brInset;     // 必须实心刷：HOLLOW 刷走 PatBlt 会整块变黑
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
@@ -659,7 +684,7 @@ static void OpenEditor(int type, int parent, const Node* src) {
                              g_hwnd, nullptr, g_hInst, (LPVOID)(INT_PTR)g_ctx.type);
     if (g_hDlg) {
         EnableRoundedCorner(g_hDlg, C_EDGE);
-        if (!AnimateWindow(g_hDlg, 120, AW_BLEND)) ShowWindow(g_hDlg, SW_SHOW);
+        FadeIn(g_hDlg, 120);
     }
 }
 
@@ -960,9 +985,8 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         EndPaint(h, &ps);
         return 0;
     }
-    case WM_PRINTCLIENT:
-        DrawDlgFace(h, (HDC)w);
-        return 0;
+    case WM_NCACTIVATE:
+        return DefWindowProcW(h, m, w, -1);
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
         bool big = (HWND)l && GetDlgCtrlID((HWND)l) == 1;      // 键值预览：加粗主色
@@ -1047,7 +1071,7 @@ static void OpenHotkeyDlg() {
                             cw, ch, g_hwnd, nullptr, g_hInst, nullptr);
     if (g_hHK) {
         EnableRoundedCorner(g_hHK, C_EDGE);
-        if (!AnimateWindow(g_hHK, 120, AW_BLEND)) ShowWindow(g_hHK, SW_SHOW);
+        FadeIn(g_hHK, 120);
     }
 }
 
@@ -1086,6 +1110,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;                         // 无边框：整个窗口为客户区
     }
+    case WM_NCACTIVATE:
+        return DefWindowProcW(h, m, w, -1);   // -1：激活切换时禁止系统重绘非客户区（防闪老边框）
     case WM_NCHITTEST: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ScreenToClient(h, &pt);
@@ -1122,9 +1148,6 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         EndPaint(h, &ps);
         return 0;
     }
-    case WM_PRINTCLIENT:                                  // AnimateWindow 淡入淡出取帧用
-        PaintAll((HDC)w);
-        return 0;
     case WM_ERASEBKGND: return 1;
     case WM_SIZE: LayoutNow(); InvalidateRect(h, nullptr, FALSE); break;
     case WM_GETMINMAXINFO: {
@@ -1276,7 +1299,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         FreeMemDC();
         for (auto& kv : g_icons) if (kv.second) DestroyIcon(kv.second);
         FreeGdiRes();
-        DeleteObject(g_brBg); DeleteObject(g_brCard);
+        DeleteObject(g_brBg); DeleteObject(g_brCard); DeleteObject(g_brInset);
         PostQuitMessage(0);
         return 0;
     }
