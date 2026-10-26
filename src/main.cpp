@@ -708,7 +708,8 @@ static void ShowMainMenu() {
     AppendMenuW(m, MF_STRING, M_ADDTAG, L"添加标签");
     AppendMenuW(m, MF_STRING, M_ADDLINK, L"添加链接");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN, L"钉住");
+    AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN,
+                g_pinned ? L"取消钉住" : L"钉住");
     AppendMenuW(m, MF_STRING | (g_hideOnFocus ? MF_CHECKED : 0), M_HIDEFOCUS, L"失焦自动隐藏");
     AppendMenuW(m, MF_STRING, M_HOTKEY, L"快捷键设置…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -871,11 +872,17 @@ static void PaintAll(HDC dc) {
     const wchar_t glyphs[3] = { 0xE711, 0xE700, 0xE718 };   // 关闭 菜单 钉住
     for (int i = 0; i < 3; i++) {
         bool hot = (g_hoverReg == R_BTN_CLOSE + i);
-        if (hot) {
+        if (hot && !(i == 2 && g_pinned)) {
             GdipFillRound(g, g_rcBtns[i], S(9), C_CARD, 255);
             GdipStrokeRound(g, g_rcBtns[i], S(9), C_SPLIT, 120, 1.0f);
         }
-        COLORREF c = (i == 2 && g_pinned) ? C_ACC : (hot ? C_TEXT : C_MUT);
+        COLORREF c = C_MUT;
+        if (i == 2 && g_pinned) {                             // 已钉住：主色胶囊 + 白色图钉，一眼可辨
+            GdipFillRound(g, g_rcBtns[2], S(9), C_ACC, 255);
+            c = C_WHITE;
+        } else if (hot) {
+            c = C_TEXT;
+        }
         DrawGlyph(dc, g_rcBtns[i], glyphs[i], c);
     }
 
@@ -964,7 +971,7 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CREATE: {
         g_hk.mod = GetPrivateProfileIntW(L"hot", L"mod", MOD_CONTROL | MOD_ALT, g_iniConf.c_str());
         g_hk.vk  = GetPrivateProfileIntW(L"hot", L"vk", 'L', g_iniConf.c_str());
-        CreateWindowExW(0, L"STATIC", L"直接按下新的快捷键组合（需含 Ctrl/Alt/Shift/Win）",
+        CreateWindowExW(0, L"STATIC", L"直接按下新的快捷键组合（单独一个键也可以）",
                         WS_CHILD | WS_VISIBLE, S(16), S(44), S(300) - S(32), S(20),
                         h, nullptr, g_hInst, nullptr);
         CreateWindowExW(0, L"STATIC", HotkeyText(g_hk.mod, g_hk.vk).c_str(),
@@ -1030,8 +1037,8 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mod |= MOD_WIN;
         if (w == VK_CONTROL || w == VK_MENU || w == VK_SHIFT || w == VK_LWIN || w == VK_RWIN) {
             g_hk.mod = mod;                                   // 只按修饰键：先记下
-        } else if (mod) {
-            g_hk.mod = mod; g_hk.vk = (int)w;
+        } else {
+            g_hk.mod = mod; g_hk.vk = (int)w;                 // 任意键均可，含无修饰键的裸键
             SetWindowTextW(GetDlgItem(h, 1), HotkeyText(g_hk.mod, g_hk.vk).c_str());
         }
         return 0;
@@ -1039,8 +1046,8 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND:
         switch (LOWORD(w)) {
         case IDOK: {
-            if (!g_hk.mod || !g_hk.vk) {
-                MessageBoxW(h, L"快捷键需包含修饰键（Ctrl/Alt/Shift/Win）。", L"启动器", MB_OK | MB_ICONWARNING);
+            if (!g_hk.vk) {
+                MessageBoxW(h, L"请先按下要设置的快捷键。", L"启动器", MB_OK | MB_ICONWARNING);
                 return 0;
             }
             if (!ApplyHotkey(g_hk.mod, g_hk.vk)) {
