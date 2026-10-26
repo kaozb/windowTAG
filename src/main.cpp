@@ -671,6 +671,10 @@ static void EnableRoundedCorner(HWND h) {
     if (!fn) return;
     LONG pref = 2;                                        // DWMWCP_ROUND
     fn(h, 33, &pref, sizeof pref);                        // DWMWA_WINDOW_CORNER_PREFERENCE
+    // 兜底：把 DWM 标题栏/边框染成界面同色——即使系统坚持画 caption 也与自绘融为一体
+    COLORREF cap = C_WHITE, border = C_WHITE;
+    fn(h, 35, &cap, sizeof cap);                          // DWMWA_CAPTION_COLOR
+    fn(h, 34, &border, sizeof border);                    // DWMWA_BORDER_COLOR
 }
 
 static void PaintAll(HDC dc) {
@@ -881,21 +885,31 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE: HideWin(); return 0;
-    case WM_NCCALCSIZE:
-        if (w) return 0;                                      // 无边框：整个窗口为客户区
-        break;
+    case WM_NCCALCSIZE: {
+        if (!w) break;
+        if (IsZoomed(h)) {                // 最大化：窗口比屏幕大一圈边框，客户区内缩，避免内容溢出
+            RECT br{ 0, 0, 0, 0 };
+            AdjustWindowRect(&br, WS_THICKFRAME | WS_CAPTION, FALSE);
+            RECT* rcp = (RECT*)l;
+            rcp->left -= br.left; rcp->top -= br.top;
+            rcp->right -= br.right; rcp->bottom -= br.bottom;
+        }
+        return 0;                         // 无边框：整个窗口为客户区
+    }
     case WM_NCHITTEST: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         ScreenToClient(h, &pt);
         RECT rc; GetClientRect(h, &rc);
-        int e = S(6);
-        bool Lt = pt.x < e, Rt = pt.x >= rc.right - e, Tp = pt.y < e, Bt = pt.y >= rc.bottom - e;
-        if (Tp && Lt) return HTTOPLEFT;
-        if (Tp && Rt) return HTTOPRIGHT;
-        if (Bt && Lt) return HTBOTTOMLEFT;
-        if (Bt && Rt) return HTBOTTOMRIGHT;
-        if (Lt) return HTLEFT; if (Rt) return HTRIGHT;
-        if (Tp) return HTTOP;  if (Bt) return HTBOTTOM;
+        if (!IsZoomed(h)) {               // 最大化时不提供边缘缩放
+            int e = S(6);
+            bool Lt = pt.x < e, Rt = pt.x >= rc.right - e, Tp = pt.y < e, Bt = pt.y >= rc.bottom - e;
+            if (Tp && Lt) return HTTOPLEFT;
+            if (Tp && Rt) return HTTOPRIGHT;
+            if (Bt && Lt) return HTBOTTOMLEFT;
+            if (Bt && Rt) return HTBOTTOMRIGHT;
+            if (Lt) return HTLEFT; if (Rt) return HTRIGHT;
+            if (Tp) return HTTOP;  if (Bt) return HTBOTTOM;
+        }
         Hit hh = HitTest(pt);
         if (PtInRect(&g_rcTitle, pt) &&
             !(hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN))
@@ -1163,6 +1177,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     MakeFonts();                                            // 按实际 DPI 重做字体
     Refresh();
     if (g_pinned) ApplyPin();
+    // 强制 DWM 立即按我们的 NCCALCSIZE 重排非客户区（否则首帧残留系统标题栏，resize 后才消失）
+    SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
+                 SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     if (!g_startHidden) ShowWin();
 
