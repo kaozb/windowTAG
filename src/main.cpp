@@ -41,6 +41,7 @@ struct Node {
 // 菜单命令 ID
 enum {
     M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT,
+    M_SORTNAME, M_ICON_S, M_ICON_M, M_ICON_L,
     L_OPEN = 201, L_ADMIN, L_LOC, L_EDIT, L_DEL,
     T_ADDLINK = 301, T_REN, T_DEL,
     BG_ADDTAG = 501, BG_ADDLINK,
@@ -65,6 +66,8 @@ static int  g_curTag = 0;               // 节点 id；0 = "全部"
 static std::vector<const Node*> g_view;
 static std::map<int, HICON> g_icons;
 static int  g_scroll = 0, g_cols = 4, g_maxScroll = 0;
+static int  g_iconSz = 32;              // 图标逻辑尺寸（24/32/48），conf ui.iconSize
+static bool g_sortName = false;         // 链接按名称排序，conf ui.sortName
 
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
 static bool g_tracking = false, g_startHidden = false;
@@ -74,7 +77,7 @@ static std::wstring g_iniConf, g_iniLinks;
 static NOTIFYICONDATAW g_nid = {};
 
 // 布局区域
-static RECT g_rcTitle, g_rcTag, g_rcGrid;
+static RECT g_rcTitle, g_rcTag, g_rcGrid, g_rcPanel;   // 面板 = 网格区圆角面板，cell 布局以它为准
 static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
 static RECT g_rcAddTag;
 static RECT g_rcBtns[3];             // 0=关闭 1=菜单 2=钉住
@@ -153,6 +156,9 @@ static void SaveWinPos() {
     WritePrivateProfileStringW(L"ui", L"w", std::to_wstring(r.right - r.left).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"h", std::to_wstring(r.bottom - r.top).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"pinned", std::to_wstring(g_pinned ? 1 : 0).c_str(), g_iniConf.c_str());
+    WritePrivateProfileStringW(L"ui", L"lastTag", std::to_wstring(g_curTag).c_str(), g_iniConf.c_str());
+    WritePrivateProfileStringW(L"ui", L"iconSize", std::to_wstring(g_iconSz).c_str(), g_iniConf.c_str());
+    WritePrivateProfileStringW(L"ui", L"sortName", std::to_wstring(g_sortName ? 1 : 0).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideOnFocus", std::to_wstring(g_hideOnFocus ? 1 : 0).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideAfterLaunch", std::to_wstring(g_hideAfterLaunch ? 1 : 0).c_str(), g_iniConf.c_str());
 }
@@ -240,6 +246,11 @@ static void RebuildView() {
         if (n.type != NT_LINK) continue;
         if (g_curTag == 0 || n.parent == g_curTag) g_view.push_back(&n);
     }
+    if (g_sortName)
+        std::sort(g_view.begin(), g_view.end(),
+                  [](const Node* a, const Node* b) {
+                      return _wcsicmp(a->name.c_str(), b->name.c_str()) < 0;
+                  });
 }
 
 static std::vector<Node*> TagList() {
@@ -402,8 +413,9 @@ static void FreeMemDC() {
 // ---------------- 布局与命中测试 ----------------
 static int TitleH() { return S(46); }
 static int TagH()   { return S(40); }
-static int CellW()  { return S(104); }
-static int CellH()  { return S(98); }
+static int IconSz() { return S(g_iconSz); }
+static int CellW()  { return IconSz() + S(72); }
+static int CellH()  { return IconSz() + S(66); }
 static int Gap()    { return S(8); }
 
 static void LayoutNow() {
@@ -411,6 +423,8 @@ static void LayoutNow() {
     g_rcTitle = { 0, 0, rc.right, TitleH() };
     g_rcTag   = { 0, TitleH(), rc.right, TitleH() + TagH() };
     g_rcGrid  = { 0, TitleH() + TagH(), rc.right, rc.bottom };
+    g_rcPanel = { g_rcGrid.left + S(10), g_rcGrid.top + S(4),
+                  g_rcGrid.right - S(10), g_rcGrid.bottom - S(10) };
 
     // 标题栏按钮：0=关闭 1=菜单 2=钉住
     int b = S(34);
@@ -437,19 +451,22 @@ static void LayoutNow() {
     ReleaseDC(g_hwnd, dc);
     g_rcAddTag = { g_rcTag.right - S(40), g_rcTag.top, g_rcTag.right, g_rcTag.bottom };
 
-    // 网格列数与滚动范围
-    int avail = g_rcGrid.right - g_rcGrid.left;
+    // 网格列数与滚动范围（以内容面板为界）
+    int avail = g_rcPanel.right - g_rcPanel.left;
     g_cols = std::max(1, (avail - Gap()) / (CellW() + Gap()));
     int rows = (int)((g_view.size() + g_cols - 1) / g_cols);
     int content = rows * (CellH() + Gap()) + Gap();
-    g_maxScroll = std::max(0, content - (int)(g_rcGrid.bottom - g_rcGrid.top));
+    g_maxScroll = std::max(0, content - (int)(g_rcPanel.bottom - g_rcPanel.top) + Gap());
     g_scroll = std::min(g_scroll, g_maxScroll);
 }
 
 static RECT CellRect(int i) {
     int col = i % g_cols, row = i / g_cols;
-    int x = g_rcGrid.left + Gap() + col * (CellW() + Gap());
-    int y = g_rcGrid.top + Gap() + row * (CellH() + Gap()) - g_scroll;
+    int cw = g_cols * CellW() + (g_cols - 1) * Gap();
+    int pw = (int)(g_rcPanel.right - g_rcPanel.left);
+    int x0 = g_rcPanel.left + std::max(Gap(), (pw - cw) / 2);
+    int x = x0 + col * (CellW() + Gap());
+    int y = g_rcPanel.top + Gap() + row * (CellH() + Gap()) - g_scroll;
     return { x, y, x + CellW(), y + CellH() };
 }
 
@@ -712,6 +729,12 @@ static void ShowMainMenu() {
     AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN,
                 g_pinned ? L"取消钉住" : L"钉住");
     AppendMenuW(m, MF_STRING | (g_hideOnFocus ? MF_CHECKED : 0), M_HIDEFOCUS, L"失焦自动隐藏");
+    AppendMenuW(m, MF_STRING | (g_sortName ? MF_CHECKED : 0), M_SORTNAME, L"按名称排序");
+    HMENU sm = CreatePopupMenu();
+    AppendMenuW(sm, MF_STRING | (g_iconSz == 24 ? MF_CHECKED : 0), M_ICON_S, L"小");
+    AppendMenuW(sm, MF_STRING | (g_iconSz == 32 ? MF_CHECKED : 0), M_ICON_M, L"中");
+    AppendMenuW(sm, MF_STRING | (g_iconSz == 48 ? MF_CHECKED : 0), M_ICON_L, L"大");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)sm, L"图标大小");
     AppendMenuW(m, MF_STRING, M_HOTKEY, L"快捷键设置…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, M_EXIT, L"退出");
@@ -722,6 +745,10 @@ static void ShowMainMenu() {
     case M_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
     case M_PIN: g_pinned = !g_pinned; ApplyPin(); SaveWinPos(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     case M_HIDEFOCUS: g_hideOnFocus = !g_hideOnFocus; SaveWinPos(); break;
+    case M_SORTNAME: g_sortName = !g_sortName; SaveWinPos(); Refresh(); break;
+    case M_ICON_S: case M_ICON_M: case M_ICON_L:
+        g_iconSz = (cmd == M_ICON_S) ? 24 : (cmd == M_ICON_M) ? 32 : 48;
+        SaveWinPos(); Refresh(); break;
     case M_HOTKEY: OpenHotkeyDlg(); break;
     case M_EXIT: Quit(); break;
     }
@@ -861,10 +888,8 @@ static void PaintAll(HDC dc) {
     gp::Graphics g(dc); GdipSetup(g);
 
     // 三区层级递进：标题/标签栏=BG → 内容面板=BAR → 卡片=CARD，亮度逐级浮起
-    RECT panel{ g_rcGrid.left + S(10), g_rcGrid.top + S(4),
-                g_rcGrid.right - S(10), g_rcGrid.bottom - S(10) };
-    GdipFillRound(g, panel, S(14), C_BAR, 255);
-    GdipStrokeRound(g, panel, S(14), C_SPLIT, 140, 1.0f);
+    GdipFillRound(g, g_rcPanel, S(14), C_BAR, 255);
+    GdipStrokeRound(g, g_rcPanel, S(14), C_SPLIT, 140, 1.0f);
 
     // 标题栏：左=应用名，右=日期 + 关闭/菜单/钉住
     {
@@ -911,14 +936,14 @@ static void PaintAll(HDC dc) {
     // 网格：轻拟物浮起卡片
     if (g_view.empty()) {
         const wchar_t* hint = g_curTag ? L"右键空白处添加链接，或直接拖入文件" : L"右键添加标签";
-        DrawTextRect(dc, g_rcGrid, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextRect(dc, g_rcPanel, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
         for (int i = 0; i < (int)g_view.size(); i++) {
             RECT r = CellRect(i);
-            if (r.bottom < g_rcGrid.top || r.top > g_rcGrid.bottom) continue;
+            if (r.bottom < g_rcPanel.top || r.top > g_rcPanel.bottom) continue;
             bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i);
             GdipCard(g, r, S(12), hot ? C_HOVER : C_CARD);
-            int isz = S(32);
+            int isz = IconSz();
             HICON ic = IconFor(*g_view[i]);
             if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, r.top + S(14), ic,
                                isz, isz, 0, nullptr, DI_NORMAL);
@@ -933,6 +958,7 @@ static void PaintAll(HDC dc) {
 // ---------------- 交互辅助 ----------------
 static void SelectTag(int id) {
     g_curTag = id;
+    SaveWinPos();                                           // 记住选中的标签
     Refresh();
 }
 
@@ -1362,6 +1388,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     int wh = std::max(S(340), (int)GetPrivateProfileIntW(L"ui", L"h", S(460), g_iniConf.c_str()));
 
     LoadNodes();
+    g_iconSz   = GetPrivateProfileIntW(L"ui", L"iconSize", 32, g_iniConf.c_str());
+    g_sortName = GetPrivateProfileIntW(L"ui", L"sortName", 0, g_iniConf.c_str()) != 0;
+    g_curTag   = GetPrivateProfileIntW(L"ui", L"lastTag", 0, g_iniConf.c_str());
+    if (Node* t = Find(g_curTag); !t || t->type != NT_TAG) g_curTag = 0;
 
     WNDCLASSEXW wc = { sizeof wc };
     wc.style = CS_HREDRAW | CS_VREDRAW;
