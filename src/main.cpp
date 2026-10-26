@@ -28,8 +28,7 @@
 
 // ---------------- 数据模型 ----------------
 enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2 };
-enum { R_NONE = 0, R_TITLE, R_SEARCH, R_GROUP, R_TAG, R_ADDTAG, R_CELL,
-       R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN };
+enum { R_NONE = 0, R_TITLE, R_GROUP, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN };
 
 struct Node {
     int id = 0, type = 0, parent = 0, count = 0;
@@ -38,11 +37,10 @@ struct Node {
 
 // 菜单命令 ID
 enum {
-    M_ADDGROUP = 101, M_ADDLINK, M_SORTCOUNT, M_SORTMANUAL, M_PIN, M_HIDEFOCUS, M_EXIT,
+    M_ADDGROUP = 101, M_ADDLINK, M_SORTCOUNT, M_SORTMANUAL, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT,
     L_OPEN = 201, L_ADMIN, L_LOC, L_EDIT, L_DEL,
-    T_REN = 301, T_DEL, T_ADDLINK,
-    G_ADDTAG = 401, G_ADDTAG2, G_ADDLINK, G_REN, G_DEL,
-    BG_ADDLINK = 501, BG_ADDTAG,
+    G_ADDLINK = 401, G_REN, G_DEL,
+    BG_ADDLINK = 501,
     TR_SHOW = 601, TR_EXIT
 };
 
@@ -55,29 +53,25 @@ static const wchar_t DLG_CLASS[]  = L"LNP_EditWnd";
 static const UINT    WM_TRAY = WM_APP + 1;
 
 static HINSTANCE g_hInst;
-static HWND      g_hwnd, g_hEdit, g_hDlg, g_hName, g_hPath, g_hParams;
-static WNDPROC   g_editOldProc;
+static HWND      g_hwnd, g_hDlg, g_hName, g_hPath, g_hParams;
 static int       g_dpi = 96;
 
 static std::vector<Node> g_nodes;
 static int  g_nextId = 1;
-static int  g_curGroup = 0, g_curTag = 0;   // 节点 id；g_curTag==0 表示"全部"
-static std::wstring g_filter;
+static int  g_curGroup = 0;
 static std::vector<const Node*> g_view;
 static std::map<int, HICON> g_icons;
 static int  g_scroll = 0, g_cols = 4, g_maxScroll = 0;
 
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
-static bool g_sortByCount = false, g_ph = true, g_tracking = false, g_startHidden = false;
+static bool g_sortByCount = false, g_tracking = false, g_startHidden = false;
 static int  g_hoverReg = R_NONE, g_hoverIdx = -1;
 
 static std::wstring g_iniConf, g_iniLinks;
 static NOTIFYICONDATAW g_nid = {};
 
 // 布局区域
-static RECT g_rcTitle, g_rcGroup, g_rcTag, g_rcGrid;
-static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
-static RECT g_rcAddTag;
+static RECT g_rcTitle, g_rcGroup, g_rcGrid;
 static RECT g_rcBtns[3];             // 0=关闭 1=菜单 2=钉住
 
 // GDI 资源
@@ -104,6 +98,7 @@ static void LaunchLink(Node* n, bool admin);
 static void OpenEditor(int type, int parent, const Node* src);
 static void HideWin();
 static void ShowMainMenu();
+static void OpenHotkeyDlg();
 
 // ---------------- 基础工具 ----------------
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -221,45 +216,16 @@ static void LoadNodes() {
 }
 
 // ---------------- 视图 ----------------
-static std::wstring Lower(std::wstring r) {
-    for (auto& c : r) c = (wchar_t)towlower(c);
-    return r;
-}
-
-static std::vector<std::wstring> Tokens(const std::wstring& s) {
-    std::vector<std::wstring> out; std::wstring cur;
-    for (wchar_t c : s) {
-        if (c == L' ' || c == L'\t') { if (!cur.empty()) { out.push_back(cur); cur.clear(); } }
-        else cur += (wchar_t)towlower(c);
-    }
-    if (!cur.empty()) out.push_back(cur);
-    return out;
-}
-
-static bool MatchAll(const Node& n, const std::vector<std::wstring>& toks) {
-    std::wstring hay = Lower(n.name + L" " + n.path + L" " + n.params);
-    for (auto& t : toks)
-        if (hay.find(t) == std::wstring::npos) return false;
-    return true;
-}
-
 static void RebuildView() {
     g_view.clear(); g_scroll = 0;
-    auto toks = Tokens(g_filter);
-    if (!toks.empty()) {                                  // 搜索：全局匹配
-        for (auto& n : g_nodes)
-            if (n.type == NT_LINK && MatchAll(n, toks)) g_view.push_back(&n);
-    } else if (g_curGroup) {
+    if (g_curGroup) {
         for (auto& n : g_nodes) {
             if (n.type != NT_LINK) continue;
-            bool show = false;
-            if (g_curTag == 0) {                          // "全部"：组内直挂 + 标签下
-                if (n.parent == g_curGroup) show = true;
-                else {
-                    const Node* p = Find(n.parent);
-                    show = p && p->type == NT_TAG && p->parent == g_curGroup;
-                }
-            } else show = (n.parent == g_curTag);
+            bool show = (n.parent == g_curGroup);         // 直挂分组
+            if (!show) {                                  // 兼容旧数据：挂在标签下的链接
+                const Node* p = Find(n.parent);
+                show = p && p->type == NT_TAG && p->parent == g_curGroup;
+            }
             if (show) g_view.push_back(&n);
         }
     }
@@ -271,12 +237,6 @@ static void RebuildView() {
 static std::vector<Node*> GroupList() {
     std::vector<Node*> v;
     for (auto& n : g_nodes) if (n.type == NT_GROUP && n.parent == 0) v.push_back(&n);
-    return v;
-}
-
-static std::vector<Node*> TagListOf(int group) {
-    std::vector<Node*> v;
-    for (auto& n : g_nodes) if (n.type == NT_TAG && n.parent == group) v.push_back(&n);
     return v;
 }
 
@@ -399,7 +359,6 @@ static void FreeMemDC() {
 // ---------------- 布局与命中测试 ----------------
 static int TitleH() { return S(46); }
 static int GroupW() { return S(148); }
-static int TagH()   { return S(40); }
 static int CellW()  { return S(104); }
 static int CellH()  { return S(98); }
 static int Gap()    { return S(8); }
@@ -408,8 +367,7 @@ static void LayoutNow() {
     RECT rc; GetClientRect(g_hwnd, &rc);
     g_rcTitle = { 0, 0, rc.right, TitleH() };
     g_rcGroup = { 0, TitleH(), GroupW(), rc.bottom };
-    g_rcTag   = { GroupW(), TitleH(), rc.right, TitleH() + TagH() };
-    g_rcGrid  = { GroupW(), TitleH() + TagH(), rc.right, rc.bottom };
+    g_rcGrid  = { GroupW(), TitleH(), rc.right, rc.bottom };
 
     // 标题栏按钮：0=关闭 1=菜单 2=钉住
     int b = S(34);
@@ -417,24 +375,6 @@ static void LayoutNow() {
         int x = g_rcTitle.right - S(10) - b * (i + 1) - S(2) * i;
         g_rcBtns[i] = { x, (TitleH() - b) / 2, x + b, (TitleH() + b) / 2 };
     }
-
-    // 标签宽度按文本实测
-    g_rcTabs.clear();
-    HDC dc = GetDC(g_hwnd);
-    HFONT of = (HFONT)SelectObject(dc, g_fUi);
-    auto tags = TagListOf(g_curGroup);
-    int x = g_rcTag.left + Gap();
-    auto addTab = [&](const wchar_t* s) {
-        SIZE sz; GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
-        RECT r{ x, g_rcTag.top, x + sz.cx + S(24), g_rcTag.bottom };
-        g_rcTabs.push_back(r);
-        x = r.right;
-    };
-    addTab(L"全部");
-    for (auto* t : tags) addTab(t->name.c_str());
-    SelectObject(dc, of);
-    ReleaseDC(g_hwnd, dc);
-    g_rcAddTag = { g_rcTag.right - S(40), g_rcTag.top, g_rcTag.right, g_rcTag.bottom };
 
     // 网格列数与滚动范围
     int avail = g_rcGrid.right - g_rcGrid.left;
@@ -465,8 +405,7 @@ static Hit HitTest(POINT p) {
     if (PtInRect(&g_rcTitle, p)) {
         for (int i = 0; i < 3; i++)
             if (PtInRect(&g_rcBtns[i], p)) { h.reg = R_BTN_CLOSE + i; return h; }
-        RECT sr{ S(12), S(8), S(12) + S(216), S(8) + S(30) };
-        h.reg = PtInRect(&sr, p) ? R_SEARCH : R_TITLE;
+        h.reg = R_TITLE;
         return h;
     }
     if (PtInRect(&g_rcGroup, p)) {
@@ -475,12 +414,6 @@ static Hit HitTest(POINT p) {
             RECT gr = GroupItemRect(i);
             if (PtInRect(&gr, p)) { h.reg = R_GROUP; h.idx = i; return h; }
         }
-        return h;
-    }
-    if (PtInRect(&g_rcTag, p)) {
-        if (PtInRect(&g_rcAddTag, p)) { h.reg = R_ADDTAG; return h; }
-        for (int i = 0; i < (int)g_rcTabs.size(); i++)
-            if (PtInRect(&g_rcTabs[i], p)) { h.reg = R_TAG; h.idx = i; return h; }
         return h;
     }
     if (PtInRect(&g_rcGrid, p)) {
@@ -517,12 +450,10 @@ static void EditorApply() {
         n.name = g_ctx.name; n.path = g_ctx.path; n.params = g_ctx.params;
         g_nodes.push_back(n); SaveNode(n); SaveNextId();
         if (n.type == NT_GROUP) g_curGroup = n.id;
-        if (n.type == NT_TAG)   g_curTag = n.id;
     } else if (Node* n = Find(g_ctx.id)) {
         n->name = g_ctx.name; n->path = g_ctx.path; n->params = g_ctx.params;
         SaveNode(*n);
     }
-    if (!g_filter.empty()) { g_filter.clear(); SetWindowTextW(g_hEdit, g_ph ? L"搜索" : L""); }
     Refresh();
     DestroyWindow(g_hDlg);
 }
@@ -639,6 +570,7 @@ static void ShowMainMenu() {
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN, L"钉住");
     AppendMenuW(m, MF_STRING | (g_hideOnFocus ? MF_CHECKED : 0), M_HIDEFOCUS, L"失焦自动隐藏");
+    AppendMenuW(m, MF_STRING, M_HOTKEY, L"快捷键设置…");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, M_EXIT, L"退出");
     RECT r = g_rcBtns[1];
@@ -646,7 +578,7 @@ static void ShowMainMenu() {
     switch (cmd) {
     case M_ADDGROUP: OpenEditor(NT_GROUP, 0, nullptr); break;
     case M_ADDLINK:
-        if (g_curGroup) OpenEditor(NT_LINK, g_curTag ? g_curTag : g_curGroup, nullptr);
+        if (g_curGroup) OpenEditor(NT_LINK, g_curGroup, nullptr);
         else MessageBoxW(g_hwnd, L"请先添加分组。", L"启动器", MB_OK | MB_ICONINFORMATION);
         break;
     case M_SORTMANUAL:
@@ -655,6 +587,7 @@ static void ShowMainMenu() {
         break;
     case M_PIN: g_pinned = !g_pinned; ApplyPin(); SaveWinPos(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     case M_HIDEFOCUS: g_hideOnFocus = !g_hideOnFocus; SaveWinPos(); break;
+    case M_HOTKEY: OpenHotkeyDlg(); break;
     case M_EXIT: Quit(); break;
     }
 }
@@ -679,28 +612,10 @@ static void ShowLinkMenu(Node* n, POINT scr) {
     case L_EDIT: OpenEditor(0, 0, n); break;
     case L_DEL:
         DeleteNodeCascade(n->id);
-        if (g_curTag == n->id) g_curTag = 0;
         if (g_curGroup == n->id) {
             auto gl = GroupList();
-            g_curGroup = gl.empty() ? 0 : gl[0]->id; g_curTag = 0;
+            g_curGroup = gl.empty() ? 0 : gl[0]->id;
         }
-        Refresh();
-        break;
-    }
-}
-
-static void ShowTagMenu(Node* tag, POINT scr) {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, T_ADDLINK, L"添加链接");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, T_REN, L"重命名");
-    AppendMenuW(m, MF_STRING, T_DEL, L"删除");
-    switch (PopupMenuScreen(m, scr)) {
-    case T_ADDLINK: OpenEditor(NT_LINK, tag->id, nullptr); break;
-    case T_REN: OpenEditor(0, 0, tag); break;
-    case T_DEL:
-        DeleteNodeCascade(tag->id);
-        if (g_curTag == tag->id) g_curTag = 0;
         Refresh();
         break;
     }
@@ -708,20 +623,18 @@ static void ShowTagMenu(Node* tag, POINT scr) {
 
 static void ShowGroupMenu(Node* grp, POINT scr) {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, G_ADDTAG, L"添加标签");
     AppendMenuW(m, MF_STRING, G_ADDLINK, L"添加链接");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, G_REN, L"重命名");
     AppendMenuW(m, MF_STRING, G_DEL, L"删除");
     switch (PopupMenuScreen(m, scr)) {
-    case G_ADDTAG: OpenEditor(NT_TAG, grp->id, nullptr); break;
-    case G_ADDLINK: OpenEditor(NT_LINK, g_curTag ? g_curTag : grp->id, nullptr); break;
+    case G_ADDLINK: OpenEditor(NT_LINK, grp->id, nullptr); break;
     case G_REN: OpenEditor(0, 0, grp); break;
     case G_DEL:
         DeleteNodeCascade(grp->id);
         if (g_curGroup == grp->id) {
             auto gl = GroupList();
-            g_curGroup = gl.empty() ? 0 : gl[0]->id; g_curTag = 0;
+            g_curGroup = gl.empty() ? 0 : gl[0]->id;
         }
         Refresh();
         break;
@@ -731,15 +644,8 @@ static void ShowGroupMenu(Node* grp, POINT scr) {
 static void ShowGridBgMenu(POINT scr) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, BG_ADDLINK, L"添加链接");
-    AppendMenuW(m, MF_STRING, BG_ADDTAG, L"添加标签");
-    switch (PopupMenuScreen(m, scr)) {
-    case BG_ADDLINK:
-        if (g_curGroup) OpenEditor(NT_LINK, g_curTag ? g_curTag : g_curGroup, nullptr);
-        break;
-    case BG_ADDTAG:
-        if (g_curGroup) OpenEditor(NT_TAG, g_curGroup, nullptr);
-        break;
-    }
+    if (g_curGroup && PopupMenuScreen(m, scr) == BG_ADDLINK)
+        OpenEditor(NT_LINK, g_curGroup, nullptr);
 }
 
 // ---------------- 绘制 ----------------
@@ -777,23 +683,20 @@ static void EnableRoundedCorner(HWND h) {
 
 static void PaintAll(HDC dc) {
     auto gl = GroupList();
-    auto tl = TagListOf(g_curGroup);
 
-    // 标题栏
+    // 标题栏：左=应用名，右=日期 + 关闭/菜单/钉住
     FillRect(dc, &g_rcTitle, g_brWhite);
     RECT lineT{ 0, g_rcTitle.bottom - 1, g_rcTitle.right, g_rcTitle.bottom };
     FillRect(dc, &lineT, g_brSplit);
-    {   // 搜索框：胶囊底（EDIT 控件无边框叠在上面）
-        RECT srb{ S(12), S(8), S(12) + S(216), S(8) + S(30) };
-        HPEN op = (HPEN)SelectObject(dc, g_penSplit);
-        HBRUSH ob = (HBRUSH)SelectObject(dc, g_brWhite);
-        RoundRect(dc, srb.left, srb.top, srb.right, srb.bottom, S(15), S(15));
-        SelectObject(dc, op); SelectObject(dc, ob);
+    {
+        RECT nr{ S(14), 0, S(240), g_rcTitle.bottom };
+        DrawTextRect(dc, nr, L"启动面板", g_fUiB, C_TEXT,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t db[32]; wsprintfW(db, L"%d月%d日", st.wMonth, st.wDay);
     RECT dr{ 0, 0, g_rcBtns[2].left - S(6), g_rcTitle.bottom };
-    DrawTextRect(dc, dr, db, g_fUi, C_TEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    DrawTextRect(dc, dr, db, g_fUi, C_MUT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     const wchar_t glyphs[3] = { 0xE711, 0xE700, 0xE718 };   // 关闭 菜单 钉住
     for (int i = 0; i < 3; i++) {
         bool hot = (g_hoverReg == R_BTN_CLOSE + i);
@@ -823,28 +726,10 @@ static void PaintAll(HDC dc) {
         DrawTextRect(dc, g_rcGroup, L"右键\n添加分组", g_fSmall, C_MUT,
                      DT_CENTER | DT_VCENTER | DT_WORDBREAK);
 
-    // 标签栏
-    FillRect(dc, &g_rcTag, g_brWhite);
-    RECT lineTag{ 0, g_rcTag.bottom - 1, g_rcTag.right, g_rcTag.bottom };
-    FillRect(dc, &lineTag, g_brSplit);
-    for (int i = 0; i < (int)g_rcTabs.size(); i++) {
-        bool sel = (i == 0) ? (g_curTag == 0)
-                            : (i - 1 < (int)tl.size() && tl[i - 1]->id == g_curTag);
-        bool hot = (g_hoverReg == R_TAG && g_hoverIdx == i);
-        const wchar_t* txt = (i == 0) ? L"全部" : tl[i - 1]->name.c_str();
-        DrawTextRect(dc, g_rcTabs[i], txt, sel ? g_fUiB : g_fUi,
-                     sel ? C_ACC : (hot ? C_TEXT : C_MUT),
-                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        if (sel) { RECT bar{ g_rcTabs[i].left, g_rcTag.bottom - S(3),
-                             g_rcTabs[i].right, g_rcTag.bottom - 1 }; FillRounded(dc, bar, g_brAccent, S(3)); }
-    }
-    DrawGlyph(dc, g_rcAddTag, 0xE710, (g_hoverReg == R_ADDTAG) ? C_TEXT : C_MUT);
-
     // 网格
     FillRect(dc, &g_rcGrid, g_brBg);
     if (g_view.empty()) {
-        const wchar_t* hint = !g_filter.empty() ? L"无匹配结果"
-            : (g_curGroup ? L"右键空白处添加链接" : L"右键添加分组");
+        const wchar_t* hint = g_curGroup ? L"右键空白处添加链接，或直接拖入文件" : L"右键添加分组";
         DrawTextRect(dc, g_rcGrid, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
         for (int i = 0; i < (int)g_view.size(); i++) {
@@ -874,54 +759,125 @@ static void PaintAll(HDC dc) {
 
 // ---------------- 交互辅助 ----------------
 static void SelectGroup(int id) {
-    g_curGroup = id; g_curTag = 0;
-    if (!g_filter.empty()) { g_filter.clear(); SetWindowTextW(g_hEdit, g_ph ? L"搜索" : L""); }
+    g_curGroup = id;
     Refresh();
 }
 
-static void OnSearchCommand(WPARAM w, LPARAM l) {
-    if ((HWND)l != g_hEdit) return;
-    switch (HIWORD(w)) {
-    case EN_SETFOCUS:
-        if (g_ph) { g_ph = false; SetWindowTextW(g_hEdit, L""); }
-        break;
-    case EN_KILLFOCUS:
-        if (!GetWindowTextLengthW(g_hEdit)) { g_ph = true; SetWindowTextW(g_hEdit, L"搜索"); }
-        break;
-    case EN_CHANGE: {
-        if (g_ph) break;
-        wchar_t b[256]; GetWindowTextW(g_hEdit, b, 256);
-        g_filter = b; Refresh();
-        break;
+// ---------------- 快捷键设置 ----------------
+static const wchar_t HK_CLASS[] = L"LNP_HotkeyWnd";
+static HWND g_hHK = nullptr;
+struct HKState { int mod = 0, vk = 0; };
+static HKState g_hk;
+
+static std::wstring HotkeyText(int mod, int vk) {
+    std::wstring s;
+    if (mod & MOD_CONTROL) s += L"Ctrl+";
+    if (mod & MOD_ALT)     s += L"Alt+";
+    if (mod & MOD_SHIFT)   s += L"Shift+";
+    if (mod & MOD_WIN)     s += L"Win+";
+    if (vk) {
+        wchar_t kb[64] = L"";
+        if ((vk >= 'A' && vk <= 'Z') || (vk >= '0' && vk <= '9'))
+            wsprintfW(kb, L"%c", (wchar_t)vk);
+        else if (!GetKeyNameTextW((LONG)MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) << 16, kb, 64))
+            lstrcpyW(kb, L"?");
+        s += kb;
     }
-    }
+    return s;
 }
 
-static void ClearFilter() {
-    if (!g_filter.empty()) {
-        g_filter.clear();
-        SetWindowTextW(g_hEdit, g_ph ? L"搜索" : L"");
+// 注销旧热键 → 注册新热键；失败则按 conf.ini 旧值回滚
+static bool ApplyHotkey(int mod, int vk) {
+    UnregisterHotKey(g_hwnd, 1);
+    if (RegisterHotKey(g_hwnd, 1, mod | MOD_NOREPEAT, (UINT)vk)) {
+        wchar_t b[32];
+        wsprintfW(b, L"%d", mod); WritePrivateProfileStringW(L"hot", L"mod", b, g_iniConf.c_str());
+        wsprintfW(b, L"%d", vk);  WritePrivateProfileStringW(L"hot", L"vk",  b, g_iniConf.c_str());
+        return true;
     }
+    int om  = GetPrivateProfileIntW(L"hot", L"mod", MOD_CONTROL | MOD_ALT, g_iniConf.c_str());
+    int ovk = GetPrivateProfileIntW(L"hot", L"vk", 'L', g_iniConf.c_str());
+    RegisterHotKey(g_hwnd, 1, om | MOD_NOREPEAT, (UINT)ovk);
+    return false;
 }
 
-// 搜索框子类化：Esc 隐藏面板，回车启动第一个结果
-static LRESULT CALLBACK SearchEditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    if (m == WM_KEYDOWN) {
-        if (w == VK_ESCAPE) { HideWin(); return 0; }
-        if (w == VK_RETURN && !g_view.empty()) { LaunchLink(const_cast<Node*>(g_view[0]), false); return 0; }
+static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        g_hk.mod = GetPrivateProfileIntW(L"hot", L"mod", MOD_CONTROL | MOD_ALT, g_iniConf.c_str());
+        g_hk.vk  = GetPrivateProfileIntW(L"hot", L"vk", 'L', g_iniConf.c_str());
+        CreateWindowExW(0, L"STATIC", L"直接按下新的快捷键组合（需含 Ctrl/Alt/Shift/Win）",
+                        WS_CHILD | WS_VISIBLE, S(16), S(14), S(300) - S(32), S(20),
+                        h, nullptr, g_hInst, nullptr);
+        CreateWindowExW(0, L"STATIC", HotkeyText(g_hk.mod, g_hk.vk).c_str(),
+                        WS_CHILD | WS_VISIBLE | SS_CENTER, S(16), S(42), S(300) - S(32), S(32),
+                        h, (HMENU)(INT_PTR)1, g_hInst, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
+                        S(300) - S(16) - S(88) * 2 - S(8), S(88), S(88), S(28), h, (HMENU)IDOK, g_hInst, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
+                        S(300) - S(16) - S(88), S(88), S(88), S(28), h, (HMENU)IDCANCEL, g_hInst, nullptr);
+        EnumChildWindows(h, [](HWND c, LPARAM) -> BOOL {
+            SendMessageW(c, WM_SETFONT, (WPARAM)g_fUi, TRUE); return TRUE; }, 0);
+        return 0;
     }
-    return CallWindowProcW(g_editOldProc, h, m, w, l);
+    case WM_ACTIVATE:
+        if (LOWORD(w)) SetFocus(h);
+        return 0;
+    case WM_KEYDOWN: {
+        if (w == VK_ESCAPE) { DestroyWindow(h); return 0; }
+        if (w == VK_RETURN) { SendMessageW(h, WM_COMMAND, IDOK, 0); return 0; }
+        int mod = 0;
+        if (GetKeyState(VK_CONTROL) < 0) mod |= MOD_CONTROL;
+        if (GetKeyState(VK_MENU) < 0)    mod |= MOD_ALT;
+        if (GetKeyState(VK_SHIFT) < 0)   mod |= MOD_SHIFT;
+        if (GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) mod |= MOD_WIN;
+        if (w == VK_CONTROL || w == VK_MENU || w == VK_SHIFT || w == VK_LWIN || w == VK_RWIN) {
+            g_hk.mod = mod;                                   // 只按修饰键：先记下
+        } else if (mod) {
+            g_hk.mod = mod; g_hk.vk = (int)w;
+            SetWindowTextW(GetDlgItem(h, 1), HotkeyText(g_hk.mod, g_hk.vk).c_str());
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
+        case IDOK: {
+            if (!g_hk.mod || !g_hk.vk) {
+                MessageBoxW(h, L"快捷键需包含修饰键（Ctrl/Alt/Shift/Win）。", L"启动器", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            if (!ApplyHotkey(g_hk.mod, g_hk.vk)) {
+                MessageBoxW(h, L"该快捷键可能已被其他程序占用，请换一个。", L"启动器", MB_OK | MB_ICONWARNING);
+                return 0;
+            }
+            DestroyWindow(h);
+            return 0;
+        }
+        case IDCANCEL: DestroyWindow(h); return 0;
+        }
+        break;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_NCDESTROY: g_hHK = nullptr; return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void OpenHotkeyDlg() {
+    if (g_hHK) { SetForegroundWindow(g_hHK); return; }
+    RECT wr{ 0, 0, S(300), S(132) };
+    AdjustWindowRect(&wr, WS_CAPTION | WS_SYSMENU, FALSE);
+    g_hHK = CreateWindowExW(0, HK_CLASS, L"快捷键设置",
+                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                            CW_USEDEFAULT, CW_USEDEFAULT,
+                            wr.right - wr.left, wr.bottom - wr.top,
+                            g_hwnd, nullptr, g_hInst, nullptr);
+    if (g_hHK) ShowWindow(g_hHK, SW_SHOW);
 }
 
 // ---------------- 主窗口过程 ----------------
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
-        g_hEdit = CreateWindowExW(0, L"EDIT", L"搜索",
-                                  WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                  S(18), S(12), S(200), S(22), h, nullptr, g_hInst, nullptr);
-        SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_fUi, TRUE);
-        g_editOldProc = (WNDPROC)SetWindowLongPtrW(g_hEdit, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
         SetTimer(h, 1, 300, nullptr);
         DragAcceptFiles(h, TRUE);
         EnableRoundedCorner(h);
@@ -959,7 +915,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (Tp) return HTTOP;  if (Bt) return HTBOTTOM;
         Hit hh = HitTest(pt);
         if (PtInRect(&g_rcTitle, pt) &&
-            hh.reg != R_SEARCH && !(hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN))
+            !(hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN))
             return HTCAPTION;
         return HTCLIENT;
     }
@@ -1008,8 +964,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (LOWORD(l) == HTCLIENT) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
             Hit hh = HitTest(pt);
-            bool hand = hh.reg == R_CELL || hh.reg == R_TAG || hh.reg == R_ADDTAG ||
-                        hh.reg == R_GROUP || (hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN);
+            bool hand = hh.reg == R_CELL || hh.reg == R_GROUP ||
+                        (hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN);
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
@@ -1032,40 +988,22 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_pinned = !g_pinned; ApplyPin(); SaveWinPos();
             InvalidateRect(h, nullptr, FALSE);
             break;
-        case R_TAG: {
-            if (hh.idx == 0) g_curTag = 0;
-            else {
-                auto tl = TagListOf(g_curGroup);
-                if (hh.idx - 1 < (int)tl.size()) g_curTag = tl[hh.idx - 1]->id;
-            }
-            ClearFilter(); Refresh();
-            break;
-        }
         case R_GROUP: {
             auto gl = GroupList();
             if (hh.idx < (int)gl.size()) SelectGroup(gl[hh.idx]->id);
             break;
         }
-        case R_ADDTAG:
-            if (g_curGroup) OpenEditor(NT_TAG, g_curGroup, nullptr);
-            else MessageBoxW(h, L"请先添加分组。", L"启动器", MB_OK | MB_ICONINFORMATION);
-            break;
         }
         return 0;
     }
     case WM_CONTEXTMENU: {
-        if ((HWND)w != h) break;                              // 搜索框右键走系统默认
+        if ((HWND)w != h) break;
         POINT scr{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         if (scr.x == -1 && scr.y == -1) break;
         POINT pt = scr; ScreenToClient(h, &pt);
         Hit hh = HitTest(pt);
         switch (hh.reg) {
         case R_CELL: ShowLinkMenu(const_cast<Node*>(g_view[hh.idx]), scr); break;
-        case R_TAG: {
-            auto tl = TagListOf(g_curGroup);
-            if (hh.idx >= 1 && hh.idx - 1 < (int)tl.size()) ShowTagMenu(tl[hh.idx - 1], scr);
-            break;
-        }
         case R_GROUP: {
             auto gl = GroupList();
             if (hh.idx < (int)gl.size()) ShowGroupMenu(gl[hh.idx], scr);
@@ -1079,7 +1017,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_DROPFILES: {                                  // 拖入文件/文件夹 → 追加为链接
         HDROP d = (HDROP)w;
-        int parent = g_curTag ? g_curTag : g_curGroup;
+        int parent = g_curGroup;
         UINT n = parent ? DragQueryFileW(d, 0xFFFFFFFF, nullptr, 0) : 0;
         for (UINT i = 0; i < n; i++) {
             wchar_t p[1024];
@@ -1098,16 +1036,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (n) Refresh();
         return 0;
     }
-    case WM_COMMAND: OnSearchCommand(w, l); break;
-    case WM_CTLCOLOREDIT:
-        if ((HWND)l == g_hEdit && g_ph) {
-            SetTextColor((HDC)w, RGB(165, 168, 172));
-            SetBkColor((HDC)w, C_WHITE);
-            return (LRESULT)g_brWhite;
-        }
-        break;
     case WM_TIMER:
-        if (w == 1 && g_hideOnFocus && IsWindowVisible(h) && !g_pinned && !g_hDlg) {
+        if (w == 1 && g_hideOnFocus && IsWindowVisible(h) && !g_pinned && !g_hDlg && !g_hHK) {
             HWND fw = GetForegroundWindow();
             if (fw != h && (!fw || GetWindow(fw, GW_OWNER) != h)) HideWin();
         }
@@ -1138,8 +1068,6 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetWindowPos(h, nullptr, r->left, r->top,
                      r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        SetWindowPos(g_hEdit, nullptr, S(18), S(12), S(200), S(22), SWP_NOZORDER);
-        SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_fUi, TRUE);
         LayoutNow(); InvalidateRect(h, nullptr, FALSE);
         break;
     }
@@ -1225,6 +1153,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     dc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     dc.lpszClassName = DLG_CLASS;
     RegisterClassW(&dc);
+
+    WNDCLASSW hk = {};
+    hk.lpfnWndProc = HKProc;
+    hk.hInstance = hInst;
+    hk.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    hk.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    hk.lpszClassName = HK_CLASS;
+    RegisterClassW(&hk);
 
     MakeFonts();
     CreateGdiRes();
