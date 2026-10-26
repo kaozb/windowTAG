@@ -81,7 +81,7 @@
 
 ## 项目实况：Windows 启动面板（windowTAG）
 
-纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。
+纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。视觉：天蓝轻拟物（胶囊标签、浮起卡片、内凹输入框，配色集中在 main.cpp 顶部 C_* 常量），设计语言参考 kaozb/app 的米白轻拟物方案，背景色按用户要求改天蓝。
 
 ### 环境
 
@@ -113,7 +113,7 @@ x86_64-w64-mingw32-g++ -std=c++17 -O1 -municode -mwindows -DUNICODE -D_UNICODE \
 ### 关键机制（改界面/窗口必读）
 
 - 无边框窗口四件套：样式无 `WS_CAPTION`（只留 `WS_THICKFRAME|WS_SYSMENU|MIN|MAX`）、`WM_NCCALCSIZE` 返回 0（最大化时客户区内缩一圈边框）、`WM_NCHITTEST` 自定义边缘、创建后 `SWP_FRAMECHANGED` 强制首帧重排——缺一会出现系统标题栏残留或内容溢出
-- Win11 观感走 DWM 属性（动态加载 dwmapi）：圆角 `DWMWCP_ROUND`、描边 `C_EDGE`、标题栏染白兜底；Win10 自动跳过
+- Win11 观感走 DWM 属性（动态加载 dwmapi）：圆角 `DWMWCP_ROUND`、描边 `C_EDGE`、标题栏染天蓝兜底；Win10 自动跳过
 - 编辑/热键对话框自绘：`WS_POPUP` + `g_dlgBtns`/`g_dlgEdits` + `DrawDlgBtns`/`FindDlgBtn`，弹出居中主窗口，两对话框互斥（共享按钮数组）
 - 主窗口绘制在 `PaintAll`，布局在 `LayoutNow`（`g_rcTabs` 布局区），命中在 `HitTest`；`S()` 按 DPI 缩放所有尺寸
 

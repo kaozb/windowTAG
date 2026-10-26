@@ -82,26 +82,31 @@ static std::vector<RECT>   g_dlgEdits;
 static HWND g_hHK = nullptr;         // 热键对话框（编辑对话框句柄见 g_hDlg）
 // GDI 资源
 static HFONT g_fUi, g_fUiB, g_fSmall, g_fGlyph;
-static HBRUSH g_brWhite, g_brBg, g_brHover, g_brSplit, g_brAccent;
-static HPEN  g_penSplit, g_penAccent;
+static HBRUSH g_brBg, g_brCard, g_brInset, g_brShad, g_brHover, g_brAccent;
+static HPEN  g_penSplit, g_penHi;
 static HDC g_memDC = nullptr; static HBITMAP g_memBmp = nullptr, g_memOld = nullptr;
 static int g_memW = 0, g_memH = 0;
 
-// 配色（浅色，对照截图）
-static const COLORREF C_BG    = RGB(246, 247, 249);
+// 配色（天蓝轻拟物：卡片浮起、输入内凹，设计语言参考 kaozb/app）
+static const COLORREF C_BG    = RGB(208, 235, 249);   // 天蓝背景
 static const COLORREF C_WHITE = RGB(255, 255, 255);
-static const COLORREF C_TEXT  = RGB(38, 38, 38);
-static const COLORREF C_MUT   = RGB(150, 152, 156);
-static const COLORREF C_ACC   = RGB(22, 119, 255);
-static const COLORREF C_HOVER = RGB(238, 242, 247);
-static const COLORREF C_SPLIT = RGB(228, 230, 233);
-static const COLORREF C_EDGE  = RGB(203, 206, 212);   // 窗口描边（比分割线深一档）
+static const COLORREF C_CARD  = RGB(241, 249, 254);   // 卡片面（近白微蓝）
+static const COLORREF C_INSET = RGB(219, 239, 250);   // 输入框内凹面
+static const COLORREF C_SHAD  = RGB(176, 208, 227);   // 卡片投影
+static const COLORREF C_TEXT  = RGB(43, 62, 81);      // 主文字（深蓝灰）
+static const COLORREF C_MUT   = RGB(112, 141, 163);   // 次要文字
+static const COLORREF C_ACC   = RGB(43, 113, 165);    // 主色（深天蓝）
+static const COLORREF C_HOVER = RGB(226, 243, 251);   // 卡片悬停面
+static const COLORREF C_SPLIT = RGB(166, 200, 221);   // 控件描边
+static const COLORREF C_EDGE  = RGB(148, 189, 215);   // 窗口描边
 
 // ---------------- 前向声明 ----------------
 static void Refresh();
 static void LayoutNow();
 static void DrawTextRect(HDC, const RECT&, const wchar_t*, HFONT, COLORREF, UINT);
 static void DrawGlyph(HDC, const RECT&, wchar_t, COLORREF);
+static void DrawCard(HDC, RECT, int, HBRUSH);
+static void FillRounded(HDC, RECT, HBRUSH, int);
 static void EnableRoundedCorner(HWND, COLORREF);
 static void LaunchLink(Node* n, bool admin);
 static void OpenEditor(int type, int parent, const Node* src);
@@ -345,13 +350,14 @@ static void MakeFonts() {
 }
 
 static void CreateGdiRes() {
-    g_brWhite   = CreateSolidBrush(C_WHITE);
-    g_brBg      = CreateSolidBrush(C_BG);
-    g_brHover   = CreateSolidBrush(C_HOVER);
-    g_brSplit   = CreateSolidBrush(C_SPLIT);
-    g_brAccent  = CreateSolidBrush(C_ACC);
-    g_penSplit  = CreatePen(PS_SOLID, 1, C_SPLIT);
-    g_penAccent = CreatePen(PS_SOLID, 1, C_ACC);
+    g_brBg     = CreateSolidBrush(C_BG);
+    g_brCard   = CreateSolidBrush(C_CARD);
+    g_brInset  = CreateSolidBrush(C_INSET);
+    g_brShad   = CreateSolidBrush(C_SHAD);
+    g_brHover  = CreateSolidBrush(C_HOVER);
+    g_brAccent = CreateSolidBrush(C_ACC);
+    g_penSplit = CreatePen(PS_SOLID, 1, C_SPLIT);
+    g_penHi    = CreatePen(PS_SOLID, 1, C_CARD);          // 卡片顶部高光
 }
 
 static void FreeMemDC() {
@@ -480,18 +486,20 @@ static const DlgBtn* FindDlgBtn(POINT pt) {
 
 static void DrawDlgBtns(HDC dc) {
     for (auto& b : g_dlgBtns) {
-        if (b.primary) {
-            HPEN ob = (HPEN)SelectObject(dc, g_penAccent);
+        if (b.primary) {                                   // 主按钮：投影 + 主色浮起
+            RECT rs = b.rc; OffsetRect(&rs, 0, S(2));
+            FillRounded(dc, rs, g_brShad, S(12));
+            HPEN op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
             HBRUSH obb = (HBRUSH)SelectObject(dc, g_brAccent);
-            RoundRect(dc, b.rc.left, b.rc.top, b.rc.right, b.rc.bottom, S(8), S(8));
-            SelectObject(dc, ob); SelectObject(dc, obb);
+            RoundRect(dc, b.rc.left, b.rc.top, b.rc.right + 1, b.rc.bottom + 1, S(12), S(12));
+            SelectObject(dc, op); SelectObject(dc, obb);
             DrawTextRect(dc, b.rc, b.txt, g_fUi, C_WHITE,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        } else {
-            HPEN ob = (HPEN)SelectObject(dc, g_penSplit);
-            HBRUSH obb = (HBRUSH)SelectObject(dc, g_brWhite);
-            RoundRect(dc, b.rc.left, b.rc.top, b.rc.right, b.rc.bottom, S(8), S(8));
-            SelectObject(dc, ob); SelectObject(dc, obb);
+        } else {                                           // 次按钮：内凹面 + 描边
+            HPEN op = (HPEN)SelectObject(dc, g_penSplit);
+            HBRUSH obb = (HBRUSH)SelectObject(dc, g_brInset);
+            RoundRect(dc, b.rc.left, b.rc.top, b.rc.right, b.rc.bottom, S(12), S(12));
+            SelectObject(dc, op); SelectObject(dc, obb);
             DrawTextRect(dc, b.rc, b.txt, g_fUi, C_TEXT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
@@ -544,16 +552,14 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
-        FillRect(dc, &rc, g_brWhite);
+        FillRect(dc, &rc, g_brCard);
         wchar_t title[128]; GetWindowTextW(h, title, 128);
         DrawTextRect(dc, { S(16), 0, S(280), S(36) }, title, g_fUiB, C_TEXT,
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        RECT line{ 0, S(36) - 1, rc.right, S(36) };
-        FillRect(dc, &line, g_brSplit);
         DrawGlyph(dc, g_rcDlgX, 0xE711, C_MUT);
         HPEN op = (HPEN)SelectObject(dc, g_penSplit);
-        for (auto& r : g_dlgEdits)                              // 圆角输入框边框
-            RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, S(8), S(8));
+        for (auto& r : g_dlgEdits)                              // 内凹输入框描边
+            RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, S(12), S(12));
         SelectObject(dc, op);
         DrawDlgBtns(dc);
         EndPaint(h, &ps);
@@ -561,15 +567,15 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w;
-        SetBkColor(dc, C_WHITE); SetTextColor(dc, C_TEXT);
+        SetBkColor(dc, C_INSET); SetTextColor(dc, C_TEXT);
         SelectObject(dc, g_fUi);
-        return (LRESULT)g_brWhite;
+        return (LRESULT)g_brInset;
     }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
-        SetBkColor(dc, C_WHITE); SetTextColor(dc, C_TEXT);
+        SetBkColor(dc, C_CARD); SetTextColor(dc, C_TEXT);
         SelectObject(dc, g_fUi);
-        return (LRESULT)g_brWhite;
+        return (LRESULT)g_brCard;
     }
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -755,6 +761,17 @@ static void FillRounded(HDC dc, RECT r, HBRUSH b, int rad) {
     SelectObject(dc, op); SelectObject(dc, ob);
 }
 
+// 轻拟物浮起卡片：投影 + 本体 + 顶部高光描边（ell 为 RoundRect 椭圆尺寸，圆角半径≈ell/2）
+static void DrawCard(HDC dc, RECT r, int ell, HBRUSH body) {
+    RECT rs = r; OffsetRect(&rs, 0, S(3));
+    FillRounded(dc, rs, g_brShad, ell);
+    FillRounded(dc, r, body, ell);
+    HPEN op = (HPEN)SelectObject(dc, g_penHi);
+    HBRUSH ob = (HBRUSH)SelectObject(dc, GetStockObject(NULL_BRUSH));
+    RoundRect(dc, r.left, r.top, r.right, r.bottom, ell, ell);
+    SelectObject(dc, op); SelectObject(dc, ob);
+}
+
 // Win11 系统圆角窗口 + 描边色；Win10 无此属性，静默跳过
 static void EnableRoundedCorner(HWND h, COLORREF border) {
     typedef LONG (WINAPI *PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
@@ -765,18 +782,17 @@ static void EnableRoundedCorner(HWND h, COLORREF border) {
     if (!fn) return;
     LONG pref = 2;                                        // DWMWCP_ROUND
     fn(h, 33, &pref, sizeof pref);                        // DWMWA_WINDOW_CORNER_PREFERENCE
-    COLORREF cap = C_WHITE;
+    COLORREF cap = C_BG;
     fn(h, 35, &cap, sizeof cap);                          // DWMWA_CAPTION_COLOR 兜底
     fn(h, 34, &border, sizeof border);                    // DWMWA_BORDER_COLOR 描边
 }
 
 static void PaintAll(HDC dc) {
     auto tl = TagList();
+    RECT rcAll{ 0, 0, g_rcTitle.right, g_rcGrid.bottom };
+    FillRect(dc, &rcAll, g_brBg);
 
     // 标题栏：左=应用名，右=日期 + 关闭/菜单/钉住
-    FillRect(dc, &g_rcTitle, g_brWhite);
-    RECT lineT{ 0, g_rcTitle.bottom - 1, g_rcTitle.right, g_rcTitle.bottom };
-    FillRect(dc, &lineT, g_brSplit);
     {
         RECT nr{ S(14), 0, S(240), g_rcTitle.bottom };
         DrawTextRect(dc, nr, L"启动面板", g_fUiB, C_TEXT,
@@ -789,30 +805,26 @@ static void PaintAll(HDC dc) {
     const wchar_t glyphs[3] = { 0xE711, 0xE700, 0xE718 };   // 关闭 菜单 钉住
     for (int i = 0; i < 3; i++) {
         bool hot = (g_hoverReg == R_BTN_CLOSE + i);
-        if (hot) FillRounded(dc, g_rcBtns[i], g_brHover, S(6));
+        if (hot) FillRounded(dc, g_rcBtns[i], g_brCard, S(10));
         COLORREF c = (i == 2 && g_pinned) ? C_ACC : (hot ? C_TEXT : C_MUT);
         DrawGlyph(dc, g_rcBtns[i], glyphs[i], c);
     }
 
-    // 标签栏
-    FillRect(dc, &g_rcTag, g_brWhite);
-    RECT lineTag{ 0, g_rcTag.bottom - 1, g_rcTag.right, g_rcTag.bottom };
-    FillRect(dc, &lineTag, g_brSplit);
+    // 标签栏：胶囊标签，选中=主色浮起
     for (int i = 0; i < (int)g_rcTabs.size(); i++) {
         bool sel = (i == 0) ? (g_curTag == 0)
                             : (i - 1 < (int)tl.size() && tl[i - 1]->id == g_curTag);
         bool hot = (g_hoverReg == R_TAG && g_hoverIdx == i);
         const wchar_t* txt = (i == 0) ? L"全部" : tl[i - 1]->name.c_str();
+        if (sel)        DrawCard(dc, g_rcTabs[i], g_rcTabs[i].bottom - g_rcTabs[i].top, g_brAccent);
+        else if (hot)   DrawCard(dc, g_rcTabs[i], g_rcTabs[i].bottom - g_rcTabs[i].top, g_brCard);
         DrawTextRect(dc, g_rcTabs[i], txt, sel ? g_fUiB : g_fUi,
-                     sel ? C_ACC : (hot ? C_TEXT : C_MUT),
+                     sel ? C_WHITE : (hot ? C_TEXT : C_MUT),
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-        if (sel) { RECT bar{ g_rcTabs[i].left, g_rcTag.bottom - S(3),
-                             g_rcTabs[i].right, g_rcTag.bottom - 1 }; FillRounded(dc, bar, g_brAccent, S(3)); }
     }
     DrawGlyph(dc, g_rcAddTag, 0xE710, (g_hoverReg == R_ADDTAG) ? C_TEXT : C_MUT);
 
-    // 网格
-    FillRect(dc, &g_rcGrid, g_brBg);
+    // 网格：轻拟物浮起卡片
     if (g_view.empty()) {
         const wchar_t* hint = g_curTag ? L"右键空白处添加链接，或直接拖入文件" : L"右键添加标签";
         DrawTextRect(dc, g_rcGrid, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -821,10 +833,7 @@ static void PaintAll(HDC dc) {
             RECT r = CellRect(i);
             if (r.bottom < g_rcGrid.top || r.top > g_rcGrid.bottom) continue;
             bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i);
-            HPEN op = (HPEN)SelectObject(dc, hot ? g_penAccent : g_penSplit);
-            HBRUSH ob = (HBRUSH)SelectObject(dc, hot ? g_brHover : g_brWhite);
-            RoundRect(dc, r.left, r.top, r.right, r.bottom, S(8), S(8));
-            SelectObject(dc, op); SelectObject(dc, ob);
+            DrawCard(dc, r, S(20), hot ? g_brHover : g_brCard);
             int isz = S(32);
             HICON ic = IconFor(*g_view[i]);
             if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, r.top + S(14), ic,
@@ -903,24 +912,21 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
-        FillRect(dc, &rc, g_brWhite);
+        FillRect(dc, &rc, g_brCard);
         DrawTextRect(dc, { S(16), 0, S(240), S(36) }, L"快捷键设置", g_fUiB, C_TEXT,
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        RECT line{ 0, S(36) - 1, rc.right, S(36) };
-        FillRect(dc, &line, g_brSplit);
         DrawGlyph(dc, g_rcDlgX, 0xE711, C_MUT);
         DrawDlgBtns(dc);
         EndPaint(h, &ps);
         return 0;
     }
-    case WM_CTLCOLOREDIT:
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
-        bool big = (HWND)l && GetDlgCtrlID((HWND)l) == 1;      // 键值预览：加粗蓝色
-        SetBkColor(dc, C_WHITE);
+        bool big = (HWND)l && GetDlgCtrlID((HWND)l) == 1;      // 键值预览：加粗主色
+        SetBkColor(dc, C_CARD);
         SetTextColor(dc, big ? C_ACC : C_TEXT);
         SelectObject(dc, big ? g_fUiB : g_fUi);
-        return (LRESULT)g_brWhite;
+        return (LRESULT)g_brCard;
     }
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -1224,9 +1230,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         FreeMemDC();
         for (auto& kv : g_icons) if (kv.second) DestroyIcon(kv.second);
         FreeGdiRes();
-        DeleteObject(g_brWhite); DeleteObject(g_brBg);
-        DeleteObject(g_brHover); DeleteObject(g_brSplit); DeleteObject(g_brAccent);
-        DeleteObject(g_penSplit); DeleteObject(g_penAccent);
+        DeleteObject(g_brBg); DeleteObject(g_brCard); DeleteObject(g_brInset);
+        DeleteObject(g_brShad); DeleteObject(g_brHover); DeleteObject(g_brAccent);
+        DeleteObject(g_penSplit); DeleteObject(g_penHi);
         PostQuitMessage(0);
         return 0;
     }
