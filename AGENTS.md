@@ -81,7 +81,7 @@
 
 ## 项目实况：Windows 启动面板（windowTAG）
 
-纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘 + GDI+（系统 gdiplus.dll）抗锯齿圆角，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。视觉：米白轻拟物（胶囊标签、浮起卡片、内凹输入框、窗口/弹窗 layered alpha 淡入淡出），配色集中在 main.cpp 顶部 C_* 常量，设计语言与 kaozb/app 同源。注意：EDIT 背景必须返回实心刷（HOLLOW 刷走 PatBlt 会整块变黑）；淡入淡出必须手动 layered alpha（AnimateWindow 增删 WS_EX_LAYERED 会闪系统老边框）。
+纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘 + GDI+（系统 gdiplus.dll）抗锯齿圆角，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。视觉：深色（取用户提供的 Global 配色表：BG 32/32/32、面板 51/51/51、卡片 59/59/59、主色 120/150/180），胶囊标签、浮起卡片、内凹输入框、窗口/弹窗 layered alpha 淡入淡出；配色集中在 main.cpp 顶部 C_* 常量。内容面板矩形由 `PanelRect()` 统一提供，卡片布局/滚动范围都以它为基准，绘制时用 `IntersectClipRect` 裁剪到面板内。设置项（图标大小 小/中/大、排序 添加顺序/名称升/名称降、选中标签）全部写入 conf.ini 的 `[ui]` 并在启动时读回。注意：EDIT 背景必须返回实心刷（HOLLOW 刷走 PatBlt 会整块变黑）；淡入淡出必须手动 layered alpha（AnimateWindow 增删 WS_EX_LAYERED 会闪系统老边框）；`data/` 目录必须在写 ini 前 `CreateDirectoryW` 创建，否则所有写入静默失败。
 
 ### 环境
 

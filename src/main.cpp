@@ -41,6 +41,8 @@ struct Node {
 // 菜单命令 ID
 enum {
     M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT,
+    M_ICON0 = 111, M_ICON1, M_ICON2,              // 图标 小/中/大
+    M_SORT0 = 121, M_SORT1, M_SORT2,               // 排序 添加顺序/名称升/名称降
     L_OPEN = 201, L_ADMIN, L_LOC, L_EDIT, L_DEL,
     T_ADDLINK = 301, T_REN, T_DEL,
     BG_ADDTAG = 501, BG_ADDLINK,
@@ -65,6 +67,8 @@ static int  g_curTag = 0;               // 节点 id；0 = "全部"
 static std::vector<const Node*> g_view;
 static std::map<int, HICON> g_icons;
 static int  g_scroll = 0, g_cols = 4, g_maxScroll = 0;
+static int  g_iconIdx = 1;              // 图标大小：0 小 / 1 中 / 2 大
+static int  g_sortMode = 0;             // 排序：0 添加顺序 / 1 名称升序 / 2 名称降序
 
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
 static bool g_tracking = false, g_startHidden = false;
@@ -90,19 +94,20 @@ static HDC g_memDC = nullptr; static HBITMAP g_memBmp = nullptr, g_memOld = null
 static int g_memW = 0, g_memH = 0;
 static ULONG_PTR g_gdipToken;
 
-// 配色（米白轻拟物，与 kaozb/app 同源：卡片浮起、输入内凹、胶囊标签）
-static const COLORREF C_BG    = RGB(240, 234, 220);   // 米白背景
+// 配色（深色，取自用户提供的 Global 配色表）
+static const COLORREF C_BG    = RGB(32, 32, 32);      // main_bk 标题/标签栏
 static const COLORREF C_WHITE = RGB(255, 255, 255);
-static const COLORREF C_CARD  = RGB(247, 242, 231);   // 卡片面
-static const COLORREF C_INSET = RGB(236, 229, 212);   // 输入框内凹面
-static const COLORREF C_SHAD  = RGB(146, 128, 98);    // 投影基色（GDI+ 低透明叠层）
-static const COLORREF C_TEXT  = RGB(62, 57, 48);      // 主文字（暖深灰）
-static const COLORREF C_MUT   = RGB(154, 146, 130);   // 次要文字
-static const COLORREF C_ACC   = RGB(124, 154, 109);   // 主色（灰绿）
-static const COLORREF C_BAR   = RGB(245, 240, 228);   // 内容面板面（介于背景与卡片之间，层级递进）
-static const COLORREF C_HOVER = RGB(251, 248, 241);   // 卡片悬停面（比卡片更浮起）
-static const COLORREF C_SPLIT = RGB(222, 213, 193);   // 控件描边
-static const COLORREF C_EDGE  = RGB(209, 198, 174);   // 窗口描边
+static const COLORREF C_BAR   = RGB(51, 51, 51);      // main_client 内容面板
+static const COLORREF C_CARD  = RGB(59, 59, 59);      // link_item_bk_hot 卡片面
+static const COLORREF C_HOVER = RGB(69, 69, 69);      // 选中/悬停面
+static const COLORREF C_INSET = RGB(43, 43, 43);      // edit_bkcolor 输入内凹
+static const COLORREF C_SHAD  = RGB(0, 0, 0);         // 投影基色
+static const COLORREF C_TEXT  = RGB(255, 255, 255);   // textdefaultcolor
+static const COLORREF C_MUT   = RGB(146, 146, 146);   // edit_promptcolor
+static const COLORREF C_ACC   = RGB(120, 150, 180);   // main_title 主色
+static const COLORREF C_ONTXT = RGB(28, 32, 38);      // 主色上的深色文字（保对比度）
+static const COLORREF C_SPLIT = RGB(107, 107, 107);   // edit_bd_nml / link_item_bd_hot
+static const COLORREF C_EDGE  = RGB(36, 36, 36);      // main_bd 窗口描边
 
 // ---------------- 前向声明 ----------------
 static void Refresh();
@@ -153,6 +158,7 @@ static void SaveWinPos() {
     WritePrivateProfileStringW(L"ui", L"w", std::to_wstring(r.right - r.left).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"h", std::to_wstring(r.bottom - r.top).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"pinned", std::to_wstring(g_pinned ? 1 : 0).c_str(), g_iniConf.c_str());
+    WritePrivateProfileStringW(L"ui", L"curTag", std::to_wstring(g_curTag).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideOnFocus", std::to_wstring(g_hideOnFocus ? 1 : 0).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideAfterLaunch", std::to_wstring(g_hideAfterLaunch ? 1 : 0).c_str(), g_iniConf.c_str());
 }
@@ -239,6 +245,14 @@ static void RebuildView() {
     for (auto& n : g_nodes) {
         if (n.type != NT_LINK) continue;
         if (g_curTag == 0 || n.parent == g_curTag) g_view.push_back(&n);
+    }
+    if (g_sortMode) {                                   // 0=添加顺序（g_nodes 原始次序）
+        bool desc = (g_sortMode == 2);
+        std::stable_sort(g_view.begin(), g_view.end(),
+                         [desc](const Node* a, const Node* b) {
+                             int c = _wcsicmp(a->name.c_str(), b->name.c_str());
+                             return desc ? c > 0 : c < 0;
+                         });
     }
 }
 
@@ -402,9 +416,16 @@ static void FreeMemDC() {
 // ---------------- 布局与命中测试 ----------------
 static int TitleH() { return S(46); }
 static int TagH()   { return S(40); }
-static int CellW()  { return S(104); }
-static int CellH()  { return S(98); }
 static int Gap()    { return S(8); }
+static int IconPx() { static const int k[3] = { 24, 32, 44 }; return S(k[g_iconIdx]); }
+static int CellW()  { static const int k[3] = { 88, 104, 124 }; return S(k[g_iconIdx]); }
+static int CellH()  { return S(14) + IconPx() + S(6) + S(18) + S(26); }
+
+// 内容面板：卡片布局的唯一坐标基准（画板、卡片、滚动范围都从这里算，避免互相越界）
+static RECT PanelRect() {
+    return { g_rcGrid.left + S(10), g_rcGrid.top + S(4),
+             g_rcGrid.right - S(10), g_rcGrid.bottom - S(10) };
+}
 
 static void LayoutNow() {
     RECT rc; GetClientRect(g_hwnd, &rc);
@@ -438,18 +459,20 @@ static void LayoutNow() {
     g_rcAddTag = { g_rcTag.right - S(40), g_rcTag.top, g_rcTag.right, g_rcTag.bottom };
 
     // 网格列数与滚动范围
-    int avail = g_rcGrid.right - g_rcGrid.left;
-    g_cols = std::max(1, (avail - Gap()) / (CellW() + Gap()));
+    RECT p = PanelRect();
+    int avail = (p.right - p.left) - Gap() * 2;
+    g_cols = std::max(1, (avail + Gap()) / (CellW() + Gap()));
     int rows = (int)((g_view.size() + g_cols - 1) / g_cols);
     int content = rows * (CellH() + Gap()) + Gap();
-    g_maxScroll = std::max(0, content - (int)(g_rcGrid.bottom - g_rcGrid.top));
+    g_maxScroll = std::max(0, content - (int)((p.bottom - p.top) - Gap()));
     g_scroll = std::min(g_scroll, g_maxScroll);
 }
 
 static RECT CellRect(int i) {
     int col = i % g_cols, row = i / g_cols;
-    int x = g_rcGrid.left + Gap() + col * (CellW() + Gap());
-    int y = g_rcGrid.top + Gap() + row * (CellH() + Gap()) - g_scroll;
+    RECT p = PanelRect();
+    int x = p.left + Gap() + col * (CellW() + Gap());
+    int y = p.top + Gap() + row * (CellH() + Gap()) - g_scroll;
     return { x, y, x + CellW(), y + CellH() };
 }
 
@@ -524,7 +547,7 @@ static void DrawDlgBtns(HDC dc) {
         FLOAT rad = (FLOAT)(b.rc.bottom - b.rc.top) / 2;      // 胶囊
         if (b.primary) {
             GdipCard(g, b.rc, rad, C_ACC);
-            DrawTextRect(dc, b.rc, b.txt, g_fUi, C_WHITE,
+            DrawTextRect(dc, b.rc, b.txt, g_fUi, C_ONTXT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             GdipFillRound(g, b.rc, rad, C_INSET, 255);
@@ -706,8 +729,20 @@ static int PopupMenuClient(HMENU m, POINT ptClient) {
 
 static void ShowMainMenu() {
     HMENU m = CreatePopupMenu();
+    HMENU mi = CreatePopupMenu();                       // 图标大小
+    for (int i = 0; i < 3; i++) {
+        static const wchar_t* kTxt[3] = { L"小", L"中", L"大" };
+        AppendMenuW(mi, MF_STRING | (g_iconIdx == i ? MF_CHECKED : 0), M_ICON0 + i, kTxt[i]);
+    }
+    HMENU ms = CreatePopupMenu();                        // 排序方式
+    for (int i = 0; i < 3; i++) {
+        static const wchar_t* kTxt[3] = { L"添加顺序", L"名称升序", L"名称降序" };
+        AppendMenuW(ms, MF_STRING | (g_sortMode == i ? MF_CHECKED : 0), M_SORT0 + i, kTxt[i]);
+    }
     AppendMenuW(m, MF_STRING, M_ADDTAG, L"添加标签");
     AppendMenuW(m, MF_STRING, M_ADDLINK, L"添加链接");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mi, L"图标大小");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)ms, L"排序方式");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN,
                 g_pinned ? L"取消钉住" : L"钉住");
@@ -724,6 +759,19 @@ static void ShowMainMenu() {
     case M_HIDEFOCUS: g_hideOnFocus = !g_hideOnFocus; SaveWinPos(); break;
     case M_HOTKEY: OpenHotkeyDlg(); break;
     case M_EXIT: Quit(); break;
+    default:
+        if (cmd >= M_ICON0 && cmd <= M_ICON2) {
+            g_iconIdx = cmd - M_ICON0;
+            WritePrivateProfileStringW(L"ui", L"iconSize", std::to_wstring(g_iconIdx).c_str(),
+                                       g_iniConf.c_str());
+            Refresh();
+        } else if (cmd >= M_SORT0 && cmd <= M_SORT2) {
+            g_sortMode = cmd - M_SORT0;
+            WritePrivateProfileStringW(L"ui", L"sort", std::to_wstring(g_sortMode).c_str(),
+                                       g_iniConf.c_str());
+            Refresh();
+        }
+        break;
     }
 }
 
@@ -836,7 +884,7 @@ static void GdipCard(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF body) {
         GdipFillRound(g, rs, rad, C_SHAD, (BYTE)(21 - i * 6));
     }
     GdipFillRound(g, r, rad, body, 255);
-    GdipStrokeRound(g, r, rad, C_WHITE, 110, 1.0f);
+    GdipStrokeRound(g, r, rad, C_WHITE, 22, 1.0f);       // 深色底上极淡高光
 }
 
 // Win11 系统圆角窗口 + 描边色；Win10 无此属性，静默跳过
@@ -861,8 +909,7 @@ static void PaintAll(HDC dc) {
     gp::Graphics g(dc); GdipSetup(g);
 
     // 三区层级递进：标题/标签栏=BG → 内容面板=BAR → 卡片=CARD，亮度逐级浮起
-    RECT panel{ g_rcGrid.left + S(10), g_rcGrid.top + S(4),
-                g_rcGrid.right - S(10), g_rcGrid.bottom - S(10) };
+    RECT panel = PanelRect();
     GdipFillRound(g, panel, S(14), C_BAR, 255);
     GdipStrokeRound(g, panel, S(14), C_SPLIT, 140, 1.0f);
 
@@ -884,9 +931,9 @@ static void PaintAll(HDC dc) {
             GdipStrokeRound(g, g_rcBtns[i], S(9), C_SPLIT, 120, 1.0f);
         }
         COLORREF c = C_MUT;
-        if (i == 2 && g_pinned) {                             // 已钉住：主色胶囊 + 白色图钉，一眼可辨
+        if (i == 2 && g_pinned) {                             // 已钉住：主色胶囊 + 深色图钉，一眼可辨
             GdipFillRound(g, g_rcBtns[2], S(9), C_ACC, 255);
-            c = C_WHITE;
+            c = C_ONTXT;
         } else if (hot) {
             c = C_TEXT;
         }
@@ -903,22 +950,27 @@ static void PaintAll(HDC dc) {
         if (sel)      GdipCard(g, g_rcTabs[i], rad, C_ACC);
         else if (hot) GdipCard(g, g_rcTabs[i], rad, C_CARD);
         DrawTextRect(dc, g_rcTabs[i], txt, sel ? g_fUiB : g_fUi,
-                     sel ? C_WHITE : (hot ? C_TEXT : C_MUT),
+                     sel ? C_ONTXT : (hot ? C_TEXT : C_MUT),
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     DrawGlyph(dc, g_rcAddTag, 0xE710, (g_hoverReg == R_ADDTAG) ? C_TEXT : C_MUT);
 
-    // 网格：轻拟物浮起卡片
+    // 网格：轻拟物浮起卡片（裁剪到面板内，滚动时图标/文字不会溢出画板）
+    RECT inner = panel;
+    InflateRect(&inner, -S(2), -S(2));
     if (g_view.empty()) {
         const wchar_t* hint = g_curTag ? L"右键空白处添加链接，或直接拖入文件" : L"右键添加标签";
-        DrawTextRect(dc, g_rcGrid, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        DrawTextRect(dc, inner, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
+        int isz = IconPx();
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, inner.left, inner.top, inner.right, inner.bottom);
+        gp::Graphics gc(dc); GdipSetup(gc);
         for (int i = 0; i < (int)g_view.size(); i++) {
             RECT r = CellRect(i);
-            if (r.bottom < g_rcGrid.top || r.top > g_rcGrid.bottom) continue;
+            if (r.bottom < inner.top || r.top > inner.bottom) continue;
             bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i);
-            GdipCard(g, r, S(12), hot ? C_HOVER : C_CARD);
-            int isz = S(32);
+            GdipCard(gc, r, S(12), hot ? C_HOVER : C_CARD);
             HICON ic = IconFor(*g_view[i]);
             if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, r.top + S(14), ic,
                                isz, isz, 0, nullptr, DI_NORMAL);
@@ -927,12 +979,15 @@ static void PaintAll(HDC dc) {
             DrawTextRect(dc, nr, g_view[i]->name.c_str(), g_fUi, C_TEXT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         }
+        RestoreDC(dc, saved);
     }
 }
 
 // ---------------- 交互辅助 ----------------
 static void SelectTag(int id) {
     g_curTag = id;
+    WritePrivateProfileStringW(L"ui", L"curTag", std::to_wstring(g_curTag).c_str(),
+                               g_iniConf.c_str());
     Refresh();
 }
 
@@ -1220,9 +1275,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             break;
         case R_TAG: {
             auto tl = TagList();
-            if (hh.idx == 0) g_curTag = 0;
-            else if (hh.idx - 1 < (int)tl.size()) g_curTag = tl[hh.idx - 1]->id;
-            Refresh();
+            if (hh.idx == 0) SelectTag(0);
+            else if (hh.idx - 1 < (int)tl.size()) SelectTag(tl[hh.idx - 1]->id);
             break;
         }
         }
@@ -1355,6 +1409,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_hideOnFocus      = GetPrivateProfileIntW(L"behavior", L"hideOnFocus", 1, g_iniConf.c_str()) != 0;
     g_hideAfterLaunch  = GetPrivateProfileIntW(L"behavior", L"hideAfterLaunch", 1, g_iniConf.c_str()) != 0;
     g_pinned           = GetPrivateProfileIntW(L"ui", L"pinned", 0, g_iniConf.c_str()) != 0;
+    g_iconIdx          = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"iconSize", 1, g_iniConf.c_str())));
+    g_sortMode         = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"sort", 0, g_iniConf.c_str())));
     g_startHidden      = GetPrivateProfileIntW(L"behavior", L"startHidden", 0, g_iniConf.c_str()) != 0;
     int wx = GetPrivateProfileIntW(L"ui", L"x", -32000, g_iniConf.c_str());
     int wy = GetPrivateProfileIntW(L"ui", L"y", -32000, g_iniConf.c_str());
@@ -1362,6 +1418,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     int wh = std::max(S(340), (int)GetPrivateProfileIntW(L"ui", L"h", S(460), g_iniConf.c_str()));
 
     LoadNodes();
+    g_curTag = GetPrivateProfileIntW(L"ui", L"curTag", 0, g_iniConf.c_str());   // 记住上次选中标签
+    if (g_curTag) {
+        bool ok = false;
+        for (auto& n : g_nodes) if (n.type == NT_TAG && n.id == g_curTag) ok = true;
+        if (!ok) g_curTag = 0;                                  // 标签已被删除则回落"全部"
+    }
 
     WNDCLASSEXW wc = { sizeof wc };
     wc.style = CS_HREDRAW | CS_VREDRAW;
