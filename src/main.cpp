@@ -99,7 +99,8 @@ static const COLORREF C_SHAD  = RGB(146, 128, 98);    // 投影基色（GDI+ 低
 static const COLORREF C_TEXT  = RGB(62, 57, 48);      // 主文字（暖深灰）
 static const COLORREF C_MUT   = RGB(154, 146, 130);   // 次要文字
 static const COLORREF C_ACC   = RGB(124, 154, 109);   // 主色（灰绿）
-static const COLORREF C_HOVER = RGB(244, 239, 228);   // 卡片悬停面
+static const COLORREF C_BAR   = RGB(245, 240, 228);   // 内容面板面（介于背景与卡片之间，层级递进）
+static const COLORREF C_HOVER = RGB(251, 248, 241);   // 卡片悬停面（比卡片更浮起）
 static const COLORREF C_SPLIT = RGB(222, 213, 193);   // 控件描边
 static const COLORREF C_EDGE  = RGB(209, 198, 174);   // 窗口描边
 
@@ -859,6 +860,12 @@ static void PaintAll(HDC dc) {
     FillRect(dc, &rcAll, g_brBg);
     gp::Graphics g(dc); GdipSetup(g);
 
+    // 三区层级递进：标题/标签栏=BG → 内容面板=BAR → 卡片=CARD，亮度逐级浮起
+    RECT panel{ g_rcGrid.left + S(10), g_rcGrid.top + S(4),
+                g_rcGrid.right - S(10), g_rcGrid.bottom - S(10) };
+    GdipFillRound(g, panel, S(14), C_BAR, 255);
+    GdipStrokeRound(g, panel, S(14), C_SPLIT, 140, 1.0f);
+
     // 标题栏：左=应用名，右=日期 + 关闭/菜单/钉住
     {
         RECT nr{ S(14), 0, S(240), g_rcTitle.bottom };
@@ -1334,6 +1341,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     std::wstring dir = ExeDir();
     g_iniConf  = dir + L"conf.ini";
+    CreateDirectoryW((dir + L"data").c_str(), nullptr);   // 目录缺失时 links.ini 所有写入会静默失败
     g_iniLinks = dir + L"data\\links.ini";
     EnsureUnicodeIni(g_iniConf);
     EnsureUnicodeIni(g_iniLinks);
