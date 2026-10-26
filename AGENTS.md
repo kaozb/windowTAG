@@ -78,3 +78,48 @@
 | 安全性 | 身份验证、授权、加密——不可妥协 |
 | 可访问性 | 原生元素自带无障碍，自定义组件需额外保障 |
 | 真实硬件校准 | 平台非理想环境：时钟漂移、传感器误差等 |
+
+## 项目实况：Windows 启动面板（windowTAG）
+
+纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。
+
+### 环境
+
+- 仓库 `github.com/kaozb/windowTAG`，唯一分支 `main`，GitHub Actions 全权构建
+- 开发在 Linux 沙箱，交叉编译器 `g++-mingw-w64-x86-64`（已 apt 安装，仅做编译校验，产物仅供预览）
+- 正式 exe 只在 CI（windows-latest + MSVC /MT /LTCG）产出
+
+### 调试手段
+
+- 编译校验命令（改完 `src/main.cpp` 必跑一遍）：
+
+```sh
+x86_64-w64-mingw32-windres --codepage 65001 -I src src/res.rc -O coff -o build/res.o
+x86_64-w64-mingw32-g++ -std=c++17 -O1 -municode -mwindows -DUNICODE -D_UNICODE \
+  -D_WIN32_WINNT=0x0A00 src/main.cpp build/res.o -o dist/Launcher-preview.exe \
+  -luser32 -lgdi32 -lshell32 -lcomdlg32 -ldwmapi -static -s
+```
+
+- MinGW 与 MSVC 差异是坑源：MSVC 默认非 UTF-8（`cl` 须 `/utf-8`、`rc` 须 `/c 65001`，否则中文字面量编译期变乱码）；`windows.h` 的 min/max 宏会打碎 `std::max`（须 `NOMINMAX`）。MinGW 预览通过 ≠ MSVC 通过，两边语法都要过
+- 界面问题（DWM、无边框、NC 区域、圆角）MinGW 预览看不出，须 CI 出包后在用户真机验证；用户是真机测试员，报问题要给出可观察的复现路径
+
+### 构建与部署
+
+- 推 `main` → Actions（`.github/workflows/build.yml`）自动：读 `VERSION` 生成 tag `v{基数}.{run_number}` → 覆写 `src/version.h` → MSVC 编译 → `gh release create` 挂 exe
+- 换版本段位改 `VERSION` 文件（当前 `0.1`）；`src/version.h` 是 CI 生成物，仓库里只是占位，不要手工维护
+- 本地 MSVC 构建：`build.bat`（VS 开发者命令行）
+- 用户从 GitHub Releases 下载 exe，绿色单文件；数据在 exe 旁 `conf.ini` + `data/links.ini`，中文依赖 UTF-16 BOM（`EnsureUnicodeIni` 预写）
+
+### 关键机制（改界面/窗口必读）
+
+- 无边框窗口四件套：样式无 `WS_CAPTION`（只留 `WS_THICKFRAME|WS_SYSMENU|MIN|MAX`）、`WM_NCCALCSIZE` 返回 0（最大化时客户区内缩一圈边框）、`WM_NCHITTEST` 自定义边缘、创建后 `SWP_FRAMECHANGED` 强制首帧重排——缺一会出现系统标题栏残留或内容溢出
+- Win11 观感走 DWM 属性（动态加载 dwmapi）：圆角 `DWMWCP_ROUND`、描边 `C_EDGE`、标题栏染白兜底；Win10 自动跳过
+- 编辑/热键对话框自绘：`WS_POPUP` + `g_dlgBtns`/`g_dlgEdits` + `DrawDlgBtns`/`FindDlgBtn`，弹出居中主窗口，两对话框互斥（共享按钮数组）
+- 主窗口绘制在 `PaintAll`，布局在 `LayoutNow`（`g_rcTabs` 布局区），命中在 `HitTest`；`S()` 按 DPI 缩放所有尺寸
+
+### 协作习惯（用户本人）
+
+- 中文交流；汇报短，先结论后论据，说清改了什么、怎么验证
+- 界面要圆角、优先系统 API、exe 越小越好、内存占用敏感；拒绝搜索框、次数统计、分组层这类冗余 UI
+- 改完代码直接提交推送 main，等 Actions 出 Release 交付；沙箱装编译工具先问一句即可（MinGW 已获授权）
+- 发布后把 Release 链接和体积一并报告
