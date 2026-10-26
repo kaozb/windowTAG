@@ -465,7 +465,7 @@ static Hit HitTest(POINT p) {
     if (PtInRect(&g_rcTitle, p)) {
         for (int i = 0; i < 3; i++)
             if (PtInRect(&g_rcBtns[i], p)) { h.reg = R_BTN_CLOSE + i; return h; }
-        RECT sr{ S(12), S(9), S(12) + S(200), S(9) + S(28) };
+        RECT sr{ S(12), S(8), S(12) + S(216), S(8) + S(30) };
         h.reg = PtInRect(&sr, p) ? R_SEARCH : R_TITLE;
         return h;
     }
@@ -755,6 +755,26 @@ static void DrawGlyph(HDC dc, const RECT& r, wchar_t g, COLORREF c) {
     DrawTextRect(dc, r, s, g_fGlyph, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+// NULL_PEN + RoundRect：纯填充无边框圆角矩形（+1 补偿 NULL_PEN 的 1px 收缩）
+static void FillRounded(HDC dc, RECT r, HBRUSH b, int rad) {
+    HBRUSH ob = (HBRUSH)SelectObject(dc, b);
+    HPEN op = (HPEN)SelectObject(dc, GetStockObject(NULL_PEN));
+    RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, rad, rad);
+    SelectObject(dc, op); SelectObject(dc, ob);
+}
+
+// Win11 系统圆角窗口；Win10 无此属性，静默跳过
+static void EnableRoundedCorner(HWND h) {
+    typedef LONG (WINAPI *PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
+    static PFN_DwmSetWindowAttribute fn = []() -> PFN_DwmSetWindowAttribute {
+        HMODULE m = LoadLibraryW(L"dwmapi.dll");
+        return m ? (PFN_DwmSetWindowAttribute)GetProcAddress(m, "DwmSetWindowAttribute") : nullptr;
+    }();
+    if (!fn) return;
+    LONG pref = 2;                                        // DWMWCP_ROUND
+    fn(h, 33, &pref, sizeof pref);                        // DWMWA_WINDOW_CORNER_PREFERENCE
+}
+
 static void PaintAll(HDC dc) {
     auto gl = GroupList();
     auto tl = TagListOf(g_curGroup);
@@ -763,6 +783,13 @@ static void PaintAll(HDC dc) {
     FillRect(dc, &g_rcTitle, g_brWhite);
     RECT lineT{ 0, g_rcTitle.bottom - 1, g_rcTitle.right, g_rcTitle.bottom };
     FillRect(dc, &lineT, g_brSplit);
+    {   // 搜索框：胶囊底（EDIT 控件无边框叠在上面）
+        RECT srb{ S(12), S(8), S(12) + S(216), S(8) + S(30) };
+        HPEN op = (HPEN)SelectObject(dc, g_penSplit);
+        HBRUSH ob = (HBRUSH)SelectObject(dc, g_brWhite);
+        RoundRect(dc, srb.left, srb.top, srb.right, srb.bottom, S(15), S(15));
+        SelectObject(dc, op); SelectObject(dc, ob);
+    }
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t db[32]; wsprintfW(db, L"%d月%d日", st.wMonth, st.wDay);
     RECT dr{ 0, 0, g_rcBtns[2].left - S(6), g_rcTitle.bottom };
@@ -770,7 +797,7 @@ static void PaintAll(HDC dc) {
     const wchar_t glyphs[3] = { 0xE711, 0xE700, 0xE718 };   // 关闭 菜单 钉住
     for (int i = 0; i < 3; i++) {
         bool hot = (g_hoverReg == R_BTN_CLOSE + i);
-        if (hot) FillRect(dc, &g_rcBtns[i], g_brHover);
+        if (hot) FillRounded(dc, g_rcBtns[i], g_brHover, S(6));
         COLORREF c = (i == 2 && g_pinned) ? C_ACC : (hot ? C_TEXT : C_MUT);
         DrawGlyph(dc, g_rcBtns[i], glyphs[i], c);
     }
@@ -781,12 +808,13 @@ static void PaintAll(HDC dc) {
     FillRect(dc, &lineG, g_brSplit);
     for (int i = 0; i < (int)gl.size(); i++) {
         RECT r = GroupItemRect(i);
+        RECT rr{ r.left + S(6), r.top, r.right - S(6), r.bottom };
         bool sel = (gl[i]->id == g_curGroup);
         bool hot = (g_hoverReg == R_GROUP && g_hoverIdx == i);
-        if (sel) FillRect(dc, &r, g_brWhite);
-        else if (hot) FillRect(dc, &r, g_brHover);
-        if (sel) { RECT bar{ r.left, r.top, r.left + S(3), r.bottom }; FillRect(dc, &bar, g_brAccent); }
-        RECT tr{ r.left + S(14), r.top, r.right - S(6), r.bottom };
+        if (sel) FillRounded(dc, rr, g_brWhite, S(6));
+        else if (hot) FillRounded(dc, rr, g_brHover, S(6));
+        if (sel) { RECT bar{ rr.left, rr.top, rr.left + S(3), rr.bottom }; FillRounded(dc, bar, g_brAccent, S(3)); }
+        RECT tr{ rr.left + S(8), r.top, rr.right - S(6), r.bottom };
         DrawTextRect(dc, tr, gl[i]->name.c_str(), sel ? g_fUiB : g_fUi,
                      sel ? C_ACC : (hot ? C_TEXT : C_MUT),
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -808,7 +836,7 @@ static void PaintAll(HDC dc) {
                      sel ? C_ACC : (hot ? C_TEXT : C_MUT),
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         if (sel) { RECT bar{ g_rcTabs[i].left, g_rcTag.bottom - S(3),
-                             g_rcTabs[i].right, g_rcTag.bottom - 1 }; FillRect(dc, &bar, g_brAccent); }
+                             g_rcTabs[i].right, g_rcTag.bottom - 1 }; FillRounded(dc, bar, g_brAccent, S(3)); }
     }
     DrawGlyph(dc, g_rcAddTag, 0xE710, (g_hoverReg == R_ADDTAG) ? C_TEXT : C_MUT);
 
@@ -889,12 +917,14 @@ static LRESULT CALLBACK SearchEditProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
-        g_hEdit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"搜索",
+        g_hEdit = CreateWindowExW(0, L"EDIT", L"搜索",
                                   WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
-                                  S(12), S(9), S(200), S(28), h, nullptr, g_hInst, nullptr);
+                                  S(18), S(12), S(200), S(22), h, nullptr, g_hInst, nullptr);
         SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_fUi, TRUE);
         g_editOldProc = (WNDPROC)SetWindowLongPtrW(g_hEdit, GWLP_WNDPROC, (LONG_PTR)SearchEditProc);
         SetTimer(h, 1, 300, nullptr);
+        DragAcceptFiles(h, TRUE);
+        EnableRoundedCorner(h);
         // 全局热键（conf.ini 可覆盖：mod=MOD_* 组合，vk=虚拟键码）
         int mod = GetPrivateProfileIntW(L"hot", L"mod", MOD_CONTROL | MOD_ALT, g_iniConf.c_str());
         int vk  = GetPrivateProfileIntW(L"hot", L"vk", 'L', g_iniConf.c_str());
@@ -1047,6 +1077,27 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_DROPFILES: {                                  // 拖入文件/文件夹 → 追加为链接
+        HDROP d = (HDROP)w;
+        int parent = g_curTag ? g_curTag : g_curGroup;
+        UINT n = parent ? DragQueryFileW(d, 0xFFFFFFFF, nullptr, 0) : 0;
+        for (UINT i = 0; i < n; i++) {
+            wchar_t p[1024];
+            if (!DragQueryFileW(d, i, p, 1024)) continue;
+            Node nd;
+            nd.id = g_nextId++; nd.type = NT_LINK; nd.parent = parent;
+            PCWSTR base = wcsrchr(p, L'\\'); base = base ? base + 1 : p;
+            nd.name = base;
+            size_t dot = nd.name.find_last_of(L'.');
+            if (dot != std::wstring::npos && dot > 0) nd.name.resize(dot);   // 去扩展名，可再编辑
+            nd.path = p;
+            g_nodes.push_back(nd); SaveNode(nd);
+        }
+        if (n) SaveNextId();
+        DragFinish(d);
+        if (n) Refresh();
+        return 0;
+    }
     case WM_COMMAND: OnSearchCommand(w, l); break;
     case WM_CTLCOLOREDIT:
         if ((HWND)l == g_hEdit && g_ph) {
@@ -1087,7 +1138,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetWindowPos(h, nullptr, r->left, r->top,
                      r->right - r->left, r->bottom - r->top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        SetWindowPos(g_hEdit, nullptr, S(12), S(9), S(200), S(28), SWP_NOZORDER);
+        SetWindowPos(g_hEdit, nullptr, S(18), S(12), S(200), S(22), SWP_NOZORDER);
         SendMessageW(g_hEdit, WM_SETFONT, (WPARAM)g_fUi, TRUE);
         LayoutNow(); InvalidateRect(h, nullptr, FALSE);
         break;
