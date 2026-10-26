@@ -81,7 +81,7 @@
 
 ## 项目实况：Windows 启动面板（windowTAG）
 
-纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。视觉：天蓝轻拟物（胶囊标签、浮起卡片、内凹输入框，配色集中在 main.cpp 顶部 C_* 常量），设计语言参考 kaozb/app 的米白轻拟物方案，背景色按用户要求改天蓝。
+纯 Win32 + C++17 单文件应用（`src/main.cpp`），GDI 自绘 + GDI+（系统 gdiplus.dll）抗锯齿圆角，零第三方依赖，目标 exe ≤200KB。界面两级：标签（NT_TAG）→ 链接（NT_LINK）；"全部"= id 0 的虚拟标签。资源类型泛化：exe/lnk/文件夹/文件/URL/命令行+参数，一律 `ShellExecuteExW`（Windows 默认方式）打开。视觉：米白轻拟物（胶囊标签、浮起卡片、内凹输入框、窗口/弹窗 AnimateWindow 淡入淡出），配色集中在 main.cpp 顶部 C_* 常量，设计语言与 kaozb/app 同源。
 
 ### 环境
 
@@ -97,7 +97,7 @@
 x86_64-w64-mingw32-windres --codepage 65001 -I src src/res.rc -O coff -o build/res.o
 x86_64-w64-mingw32-g++ -std=c++17 -O1 -municode -mwindows -DUNICODE -D_UNICODE \
   -D_WIN32_WINNT=0x0A00 src/main.cpp build/res.o -o dist/Launcher-preview.exe \
-  -luser32 -lgdi32 -lshell32 -lcomdlg32 -ldwmapi -static -s
+  -luser32 -lgdi32 -lgdiplus -lshell32 -lcomdlg32 -ldwmapi -static -s
 ```
 
 - MinGW 与 MSVC 差异是坑源：MSVC 默认非 UTF-8（`cl` 须 `/utf-8`、`rc` 须 `/c 65001`，否则中文字面量编译期变乱码）；`windows.h` 的 min/max 宏会打碎 `std::max`（须 `NOMINMAX`）。MinGW 预览通过 ≠ MSVC 通过，两边语法都要过
