@@ -75,7 +75,11 @@ static RECT g_rcTitle, g_rcTag, g_rcGrid;
 static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
 static RECT g_rcAddTag;
 static RECT g_rcBtns[3];             // 0=关闭 1=菜单 2=钉住
-
+static RECT g_rcDlgX;                // 编辑对话框右上角关闭区
+struct DlgBtn { RECT rc; int id; const wchar_t* txt; bool primary; };
+static std::vector<DlgBtn> g_dlgBtns;
+static std::vector<RECT>   g_dlgEdits;
+static HWND g_hHK = nullptr;         // 热键对话框（编辑对话框句柄见 g_hDlg）
 // GDI 资源
 static HFONT g_fUi, g_fUiB, g_fSmall, g_fGlyph;
 static HBRUSH g_brWhite, g_brBg, g_brHover, g_brSplit, g_brAccent;
@@ -91,10 +95,14 @@ static const COLORREF C_MUT   = RGB(150, 152, 156);
 static const COLORREF C_ACC   = RGB(22, 119, 255);
 static const COLORREF C_HOVER = RGB(238, 242, 247);
 static const COLORREF C_SPLIT = RGB(228, 230, 233);
+static const COLORREF C_EDGE  = RGB(203, 206, 212);   // 窗口描边（比分割线深一档）
 
 // ---------------- 前向声明 ----------------
 static void Refresh();
 static void LayoutNow();
+static void DrawTextRect(HDC, const RECT&, const wchar_t*, HFONT, COLORREF, UINT);
+static void DrawGlyph(HDC, const RECT&, wchar_t, COLORREF);
+static void EnableRoundedCorner(HWND, COLORREF);
 static void LaunchLink(Node* n, bool admin);
 static void OpenEditor(int type, int parent, const Node* src);
 static void HideWin();
@@ -464,59 +472,141 @@ static void EditorApply() {
     DestroyWindow(g_hDlg);
 }
 
+// 编辑/热键对话框共用：自绘按钮绘制与命中
+static const DlgBtn* FindDlgBtn(POINT pt) {
+    for (auto& b : g_dlgBtns) if (PtInRect(&b.rc, pt)) return &b;
+    return nullptr;
+}
+
+static void DrawDlgBtns(HDC dc) {
+    for (auto& b : g_dlgBtns) {
+        if (b.primary) {
+            HPEN ob = (HPEN)SelectObject(dc, g_penAccent);
+            HBRUSH obb = (HBRUSH)SelectObject(dc, g_brAccent);
+            RoundRect(dc, b.rc.left, b.rc.top, b.rc.right, b.rc.bottom, S(8), S(8));
+            SelectObject(dc, ob); SelectObject(dc, obb);
+            DrawTextRect(dc, b.rc, b.txt, g_fUi, C_WHITE,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            HPEN ob = (HPEN)SelectObject(dc, g_penSplit);
+            HBRUSH obb = (HBRUSH)SelectObject(dc, g_brWhite);
+            RoundRect(dc, b.rc.left, b.rc.top, b.rc.right, b.rc.bottom, S(8), S(8));
+            SelectObject(dc, ob); SelectObject(dc, obb);
+            DrawTextRect(dc, b.rc, b.txt, g_fUi, C_TEXT,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+}
+
 static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_CREATE: {
-        // 客户区：链接 380x210；分组/标签 380x140
+        // 自绘对话框：仅 EDIT 是子窗口，标签/按钮/边框全部 WM_PAINT 绘制
         int type = (int)(INT_PTR)((CREATESTRUCTW*)l)->lpCreateParams;
-        int cw = S(380), ch = (type == NT_LINK) ? S(210) : S(140);
-        int x = S(16), lw = S(48), fw = cw - S(16) * 2 - lw;
+        g_dlgBtns.clear(); g_dlgEdits.clear();
         g_hName = g_hPath = g_hParams = nullptr;
-        auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD st,
-                      int px, int py, int pw, int ph, int id) -> HWND {
-            DWORD ex = wcscmp(cls, L"EDIT") ? 0 : WS_EX_CLIENTEDGE;
-            return CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | st,
-                                   px, py, pw, ph, h, (HMENU)(INT_PTR)id,
-                                   ((CREATESTRUCTW*)l)->hInstance, nullptr);
+        HINSTANCE inst = ((CREATESTRUCTW*)l)->hInstance;
+        auto label = [&](const wchar_t* t, int px, int py) {
+            CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
+                            px, py, S(48), S(18), h, nullptr, inst, nullptr);
         };
-        mk(L"STATIC", L"名称", 0, x, S(22), lw, S(18), 0);
-        g_hName = mk(L"EDIT", g_ctx.name.c_str(), ES_AUTOHSCROLL | WS_TABSTOP,
-                     x + lw, S(16), fw, S(24), IDC_NAME);
+        auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id) -> HWND {
+            HWND c = CreateWindowExW(0, L"EDIT", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                     px, py, pw, S(28), h, (HMENU)(INT_PTR)id, inst, nullptr);
+            SendMessageW(c, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(8), S(8)));
+            g_dlgEdits.push_back({ px, py, px + pw, py + S(28) });
+            return c;
+        };
+        auto btn = [&](int px, int py, int pw, int id, const wchar_t* txt, bool pri) {
+            g_dlgBtns.push_back({ { px, py, px + pw, py + S(28) }, id, txt, pri });
+        };
+        int x = S(16), lw = S(48), fw = S(380) - x * 2 - lw;
+        label(L"名称", x, S(46) + S(5));
+        g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
+        int by;
         if (type == NT_LINK) {
-            mk(L"STATIC", L"目标", 0, x, S(58), lw, S(18), 0);
-            g_hPath = mk(L"EDIT", g_ctx.path.c_str(), ES_AUTOHSCROLL | WS_TABSTOP,
-                         x + lw, S(52), fw - S(76), S(24), IDC_PATH);
-            mk(L"BUTTON", L"浏览…", BS_PUSHBUTTON | WS_TABSTOP,
-               x + lw + fw - S(76) + S(8), S(52), S(68), S(24), IDC_BROWSE);
-            mk(L"STATIC", L"参数", 0, x, S(94), lw, S(18), 0);
-            g_hParams = mk(L"EDIT", g_ctx.params.c_str(), ES_AUTOHSCROLL | WS_TABSTOP,
-                           x + lw, S(88), fw, S(24), IDC_PARAMS);
+            label(L"目标", x, S(88) + S(5));
+            g_hPath = edit(x + lw, S(88), fw - S(80), g_ctx.path.c_str(), IDC_PATH);
+            btn(S(380) - x - S(72), S(88), S(72), IDC_BROWSE, L"浏览…", false);
+            label(L"参数", x, S(130) + S(5));
+            g_hParams = edit(x + lw, S(130), fw, g_ctx.params.c_str(), IDC_PARAMS);
+            by = S(170);
+        } else {
+            by = S(96);
         }
-        int by = (type == NT_LINK) ? S(140) : S(94);
-        mk(L"BUTTON", L"确定", BS_DEFPUSHBUTTON | WS_TABSTOP,
-           cw - S(16) - S(88) * 2 - S(8), by, S(88), S(26), IDOK);
-        mk(L"BUTTON", L"取消", BS_PUSHBUTTON | WS_TABSTOP,
-           cw - S(16) - S(88), by, S(88), S(26), IDCANCEL);
-        EnumChildWindows(h, [](HWND c, LPARAM) -> BOOL {
-            SendMessageW(c, WM_SETFONT, (WPARAM)g_fUi, TRUE); return TRUE; }, 0);
+        btn(S(380) - x - S(88) * 2 - S(8), by, S(88), IDOK, L"确定", true);
+        btn(S(380) - x - S(88), by, S(88), IDCANCEL, L"取消", false);
+        g_rcDlgX = { S(380) - S(40), 0, S(380) - S(8), S(36) };
         SendMessageW(g_hName, EM_SETSEL, 0, -1);
         SetFocus(g_hName);
         return 0;
     }
-    case WM_COMMAND:
-        switch (LOWORD(w)) {
-        case IDC_BROWSE: {
-            wchar_t file[1024] = L"";
-            if (g_hPath) GetWindowTextW(g_hPath, file, 1024);
-            OPENFILENAMEW ofn = {};
-            ofn.lStructSize = sizeof ofn;
-            ofn.hwndOwner = h;
-            ofn.lpstrFilter = L"程序/链接 (*.exe;*.lnk;*.url;*.bat)\0*.exe;*.lnk;*.url;*.bat\0所有文件\0*.*\0";
-            ofn.lpstrFile = file; ofn.nMaxFile = 1024;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-            if (GetOpenFileNameW(&ofn)) SetWindowTextW(g_hPath, file);
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_brWhite);
+        wchar_t title[128]; GetWindowTextW(h, title, 128);
+        DrawTextRect(dc, { S(16), 0, S(280), S(36) }, title, g_fUiB, C_TEXT,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        RECT line{ 0, S(36) - 1, rc.right, S(36) };
+        FillRect(dc, &line, g_brSplit);
+        DrawGlyph(dc, g_rcDlgX, 0xE711, C_MUT);
+        HPEN op = (HPEN)SelectObject(dc, g_penSplit);
+        for (auto& r : g_dlgEdits)                              // 圆角输入框边框
+            RoundRect(dc, r.left, r.top, r.right + 1, r.bottom + 1, S(8), S(8));
+        SelectObject(dc, op);
+        DrawDlgBtns(dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)w;
+        SetBkColor(dc, C_WHITE); SetTextColor(dc, C_TEXT);
+        SelectObject(dc, g_fUi);
+        return (LRESULT)g_brWhite;
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)w;
+        SetBkColor(dc, C_WHITE); SetTextColor(dc, C_TEXT);
+        SelectObject(dc, g_fUi);
+        return (LRESULT)g_brWhite;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (PtInRect(&g_rcDlgX, pt)) { DestroyWindow(h); return 0; }
+        if (const DlgBtn* b = FindDlgBtn(pt)) {
+            if (b->id == IDOK) EditorApply();
+            else if (b->id == IDCANCEL) DestroyWindow(h);
+            else if (b->id == IDC_BROWSE) {
+                wchar_t file[1024] = L"";
+                if (g_hPath) GetWindowTextW(g_hPath, file, 1024);
+                OPENFILENAMEW ofn = {};
+                ofn.lStructSize = sizeof ofn;
+                ofn.hwndOwner = h;
+                ofn.lpstrFilter = L"程序/链接 (*.exe;*.lnk;*.url;*.bat)\0*.exe;*.lnk;*.url;*.bat\0所有文件\0*.*\0";
+                ofn.lpstrFile = file; ofn.nMaxFile = 1024;
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+                if (GetOpenFileNameW(&ofn)) { SetWindowTextW(g_hPath, file); SetFocus(g_hPath); }
+            }
             return 0;
         }
+        if (pt.y < S(36)) {                                     // 标题栏拖动
+            ReleaseCapture();
+            SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        if (LOWORD(l) == HTCLIENT) {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
+            bool hand = PtInRect(&g_rcDlgX, pt) || FindDlgBtn(pt);
+            SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_COMMAND:
+        switch (LOWORD(w)) {
         case IDOK: EditorApply(); return 0;
         case IDCANCEL: DestroyWindow(h); return 0;
         }
@@ -529,6 +619,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void OpenEditor(int type, int parent, const Node* src) {
     if (g_hDlg) { SetForegroundWindow(g_hDlg); return; }
+    if (g_hHK) DestroyWindow(g_hHK);   // 按钮数组全局共享，禁止两个对话框并发
     g_ctx = EditCtx();
     g_ctx.isNew = !src;
     if (src) {
@@ -538,17 +629,20 @@ static void OpenEditor(int type, int parent, const Node* src) {
         g_ctx.type = type; g_ctx.parent = parent;
     }
     const wchar_t* title = g_ctx.isNew
-        ? (type == NT_LINK ? L"添加链接" : type == NT_TAG ? L"添加标签" : L"添加分组")
+        ? (type == NT_LINK ? L"添加链接" : L"添加标签")
         : L"编辑";
     int cw = S(380), ch = (g_ctx.type == NT_LINK) ? S(210) : S(140);
-    RECT wr{ 0, 0, cw, ch };
-    AdjustWindowRect(&wr, WS_CAPTION | WS_SYSMENU, FALSE);
-    g_hDlg = CreateWindowExW(0, DLG_CLASS, title,
-                             WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                             CW_USEDEFAULT, CW_USEDEFAULT,
-                             wr.right - wr.left, wr.bottom - wr.top,
+    RECT mr{};                                                  // 居中于主窗口
+    if (g_hwnd) GetWindowRect(g_hwnd, &mr);
+    int dx = mr.left + ((mr.right - mr.left) - cw) / 2;
+    int dy = mr.top + ((mr.bottom - mr.top) - ch) / 2;
+    g_hDlg = CreateWindowExW(0, DLG_CLASS, title, WS_POPUP,
+                             dx, dy, cw, ch,
                              g_hwnd, nullptr, g_hInst, (LPVOID)(INT_PTR)g_ctx.type);
-    if (g_hDlg) ShowWindow(g_hDlg, SW_SHOW);
+    if (g_hDlg) {
+        EnableRoundedCorner(g_hDlg, C_EDGE);
+        ShowWindow(g_hDlg, SW_SHOW);
+    }
 }
 
 // ---------------- 菜单 ----------------
@@ -661,8 +755,8 @@ static void FillRounded(HDC dc, RECT r, HBRUSH b, int rad) {
     SelectObject(dc, op); SelectObject(dc, ob);
 }
 
-// Win11 系统圆角窗口；Win10 无此属性，静默跳过
-static void EnableRoundedCorner(HWND h) {
+// Win11 系统圆角窗口 + 描边色；Win10 无此属性，静默跳过
+static void EnableRoundedCorner(HWND h, COLORREF border) {
     typedef LONG (WINAPI *PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
     static PFN_DwmSetWindowAttribute fn = []() -> PFN_DwmSetWindowAttribute {
         HMODULE m = LoadLibraryW(L"dwmapi.dll");
@@ -671,10 +765,9 @@ static void EnableRoundedCorner(HWND h) {
     if (!fn) return;
     LONG pref = 2;                                        // DWMWCP_ROUND
     fn(h, 33, &pref, sizeof pref);                        // DWMWA_WINDOW_CORNER_PREFERENCE
-    // 兜底：把 DWM 标题栏/边框染成界面同色——即使系统坚持画 caption 也与自绘融为一体
-    COLORREF cap = C_WHITE, border = C_WHITE;
-    fn(h, 35, &cap, sizeof cap);                          // DWMWA_CAPTION_COLOR
-    fn(h, 34, &border, sizeof border);                    // DWMWA_BORDER_COLOR
+    COLORREF cap = C_WHITE;
+    fn(h, 35, &cap, sizeof cap);                          // DWMWA_CAPTION_COLOR 兜底
+    fn(h, 34, &border, sizeof border);                    // DWMWA_BORDER_COLOR 描边
 }
 
 static void PaintAll(HDC dc) {
@@ -752,7 +845,6 @@ static void SelectTag(int id) {
 
 // ---------------- 快捷键设置 ----------------
 static const wchar_t HK_CLASS[] = L"LNP_HotkeyWnd";
-static HWND g_hHK = nullptr;
 struct HKState { int mod = 0, vk = 0; };
 static HKState g_hk;
 
@@ -794,18 +886,63 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_hk.mod = GetPrivateProfileIntW(L"hot", L"mod", MOD_CONTROL | MOD_ALT, g_iniConf.c_str());
         g_hk.vk  = GetPrivateProfileIntW(L"hot", L"vk", 'L', g_iniConf.c_str());
         CreateWindowExW(0, L"STATIC", L"直接按下新的快捷键组合（需含 Ctrl/Alt/Shift/Win）",
-                        WS_CHILD | WS_VISIBLE, S(16), S(14), S(300) - S(32), S(20),
+                        WS_CHILD | WS_VISIBLE, S(16), S(44), S(300) - S(32), S(20),
                         h, nullptr, g_hInst, nullptr);
         CreateWindowExW(0, L"STATIC", HotkeyText(g_hk.mod, g_hk.vk).c_str(),
-                        WS_CHILD | WS_VISIBLE | SS_CENTER, S(16), S(42), S(300) - S(32), S(32),
+                        WS_CHILD | WS_VISIBLE | SS_CENTER, S(16), S(72), S(300) - S(32), S(30),
                         h, (HMENU)(INT_PTR)1, g_hInst, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"确定", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON | WS_TABSTOP,
-                        S(300) - S(16) - S(88) * 2 - S(8), S(88), S(88), S(28), h, (HMENU)IDOK, g_hInst, nullptr);
-        CreateWindowExW(0, L"BUTTON", L"取消", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP,
-                        S(300) - S(16) - S(88), S(88), S(88), S(28), h, (HMENU)IDCANCEL, g_hInst, nullptr);
-        EnumChildWindows(h, [](HWND c, LPARAM) -> BOOL {
-            SendMessageW(c, WM_SETFONT, (WPARAM)g_fUi, TRUE); return TRUE; }, 0);
+        g_dlgBtns.clear(); g_dlgEdits.clear();
+        g_dlgBtns.push_back({ { S(300) - S(16) - S(88) * 2 - S(8), S(112),
+                                S(300) - S(16) - S(88) - S(8), S(140) }, IDOK, L"确定", true });
+        g_dlgBtns.push_back({ { S(300) - S(16) - S(88), S(112),
+                                S(300) - S(16), S(140) }, IDCANCEL, L"取消", false });
+        g_rcDlgX = { S(300) - S(40), 0, S(300) - S(8), S(36) };
+        SetFocus(h);
         return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_brWhite);
+        DrawTextRect(dc, { S(16), 0, S(240), S(36) }, L"快捷键设置", g_fUiB, C_TEXT,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        RECT line{ 0, S(36) - 1, rc.right, S(36) };
+        FillRect(dc, &line, g_brSplit);
+        DrawGlyph(dc, g_rcDlgX, 0xE711, C_MUT);
+        DrawDlgBtns(dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_CTLCOLOREDIT:
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)w;
+        bool big = (HWND)l && GetDlgCtrlID((HWND)l) == 1;      // 键值预览：加粗蓝色
+        SetBkColor(dc, C_WHITE);
+        SetTextColor(dc, big ? C_ACC : C_TEXT);
+        SelectObject(dc, big ? g_fUiB : g_fUi);
+        return (LRESULT)g_brWhite;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (PtInRect(&g_rcDlgX, pt)) { DestroyWindow(h); return 0; }
+        if (const DlgBtn* b = FindDlgBtn(pt)) {
+            SendMessageW(h, WM_COMMAND, b->id, 0);
+            return 0;
+        }
+        if (pt.y < S(36)) {
+            ReleaseCapture();
+            SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        if (LOWORD(l) == HTCLIENT) {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
+            bool hand = PtInRect(&g_rcDlgX, pt) || FindDlgBtn(pt);
+            SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
     }
     case WM_ACTIVATE:
         if (LOWORD(w)) SetFocus(h);
@@ -851,14 +988,18 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void OpenHotkeyDlg() {
     if (g_hHK) { SetForegroundWindow(g_hHK); return; }
-    RECT wr{ 0, 0, S(300), S(132) };
-    AdjustWindowRect(&wr, WS_CAPTION | WS_SYSMENU, FALSE);
-    g_hHK = CreateWindowExW(0, HK_CLASS, L"快捷键设置",
-                            WS_POPUP | WS_CAPTION | WS_SYSMENU,
-                            CW_USEDEFAULT, CW_USEDEFAULT,
-                            wr.right - wr.left, wr.bottom - wr.top,
-                            g_hwnd, nullptr, g_hInst, nullptr);
-    if (g_hHK) ShowWindow(g_hHK, SW_SHOW);
+    if (g_hDlg) DestroyWindow(g_hDlg);   // 按钮数组全局共享，禁止两个对话框并发
+    int cw = S(300), ch = S(156);
+    RECT mr{};
+    if (g_hwnd) GetWindowRect(g_hwnd, &mr);
+    g_hHK = CreateWindowExW(0, HK_CLASS, L"快捷键设置", WS_POPUP,
+                            mr.left + ((mr.right - mr.left) - cw) / 2,
+                            mr.top + ((mr.bottom - mr.top) - ch) / 2,
+                            cw, ch, g_hwnd, nullptr, g_hInst, nullptr);
+    if (g_hHK) {
+        EnableRoundedCorner(g_hHK, C_EDGE);
+        ShowWindow(g_hHK, SW_SHOW);
+    }
 }
 
 // ---------------- 主窗口过程 ----------------
@@ -867,7 +1008,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CREATE: {
         SetTimer(h, 1, 300, nullptr);
         DragAcceptFiles(h, TRUE);
-        EnableRoundedCorner(h);
+        EnableRoundedCorner(h, C_EDGE);
         // 全局热键（conf.ini 可覆盖：mod=MOD_* 组合，vk=虚拟键码）
         int mod = GetPrivateProfileIntW(L"hot", L"mod", MOD_CONTROL | MOD_ALT, g_iniConf.c_str());
         int vk  = GetPrivateProfileIntW(L"hot", L"vk", 'L', g_iniConf.c_str());
