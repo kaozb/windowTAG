@@ -28,19 +28,19 @@
 
 // ---------------- 数据模型 ----------------
 enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2 };
-enum { R_NONE = 0, R_TITLE, R_GROUP, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN };
+enum { R_NONE = 0, R_TITLE, R_TAG, R_ADDTAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN };
 
 struct Node {
-    int id = 0, type = 0, parent = 0, count = 0;
+    int id = 0, type = 0, parent = 0;
     std::wstring name, path, params;
 };
 
 // 菜单命令 ID
 enum {
-    M_ADDGROUP = 101, M_ADDLINK, M_SORTCOUNT, M_SORTMANUAL, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT,
+    M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT,
     L_OPEN = 201, L_ADMIN, L_LOC, L_EDIT, L_DEL,
-    G_ADDLINK = 401, G_REN, G_DEL,
-    BG_ADDLINK = 501,
+    T_ADDLINK = 301, T_REN, T_DEL,
+    BG_ADDTAG = 501, BG_ADDLINK,
     TR_SHOW = 601, TR_EXIT
 };
 
@@ -58,32 +58,33 @@ static int       g_dpi = 96;
 
 static std::vector<Node> g_nodes;
 static int  g_nextId = 1;
-static int  g_curGroup = 0;
+static int  g_curTag = 0;               // 节点 id；0 = "全部"
 static std::vector<const Node*> g_view;
 static std::map<int, HICON> g_icons;
 static int  g_scroll = 0, g_cols = 4, g_maxScroll = 0;
 
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
-static bool g_sortByCount = false, g_tracking = false, g_startHidden = false;
+static bool g_tracking = false, g_startHidden = false;
 static int  g_hoverReg = R_NONE, g_hoverIdx = -1;
 
 static std::wstring g_iniConf, g_iniLinks;
 static NOTIFYICONDATAW g_nid = {};
 
 // 布局区域
-static RECT g_rcTitle, g_rcGroup, g_rcGrid;
+static RECT g_rcTitle, g_rcTag, g_rcGrid;
+static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
+static RECT g_rcAddTag;
 static RECT g_rcBtns[3];             // 0=关闭 1=菜单 2=钉住
 
 // GDI 资源
 static HFONT g_fUi, g_fUiB, g_fSmall, g_fGlyph;
-static HBRUSH g_brWhite, g_brBg, g_brGroupBg, g_brHover, g_brSplit, g_brAccent;
+static HBRUSH g_brWhite, g_brBg, g_brHover, g_brSplit, g_brAccent;
 static HPEN  g_penSplit, g_penAccent;
 static HDC g_memDC = nullptr; static HBITMAP g_memBmp = nullptr, g_memOld = nullptr;
 static int g_memW = 0, g_memH = 0;
 
 // 配色（浅色，对照截图）
 static const COLORREF C_BG    = RGB(246, 247, 249);
-static const COLORREF C_GRPB  = RGB(242, 243, 245);
 static const COLORREF C_WHITE = RGB(255, 255, 255);
 static const COLORREF C_TEXT  = RGB(38, 38, 38);
 static const COLORREF C_MUT   = RGB(150, 152, 156);
@@ -132,7 +133,6 @@ static void SaveWinPos() {
     WritePrivateProfileStringW(L"ui", L"w", std::to_wstring(r.right - r.left).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"h", std::to_wstring(r.bottom - r.top).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"pinned", std::to_wstring(g_pinned ? 1 : 0).c_str(), g_iniConf.c_str());
-    WritePrivateProfileStringW(L"ui", L"sortByCount", std::to_wstring(g_sortByCount ? 1 : 0).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideOnFocus", std::to_wstring(g_hideOnFocus ? 1 : 0).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideAfterLaunch", std::to_wstring(g_hideAfterLaunch ? 1 : 0).c_str(), g_iniConf.c_str());
 }
@@ -156,7 +156,6 @@ static void SaveNode(const Node& n) {
     WritePrivateProfileStringW(sec, L"name",   n.name.c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"path",   n.path.c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"params", n.params.c_str(), g_iniLinks.c_str());
-    WritePrivateProfileStringW(sec, L"count",  std::to_wstring(n.count).c_str(), g_iniLinks.c_str());
 }
 
 static void SaveNextId() {
@@ -185,11 +184,11 @@ static void DeleteNodeCascade(int id) {
 
 static void Seed() {
     g_nodes.clear();
-    Node g; g.id = 1; g.type = NT_GROUP; g.name = L"常用";
-    Node t; t.id = 2; t.type = NT_TAG; t.parent = 1; t.name = L"工具";
-    Node l; l.id = 3; l.type = NT_LINK; l.parent = 2; l.name = L"腾讯文档"; l.path = L"https://docs.qq.com";
-    g_nodes = { g, t, l };
-    g_nextId = 4;
+    Node t; t.id = 1; t.type = NT_TAG; t.name = L"常用";
+    Node l; l.id = 2; l.type = NT_LINK; l.parent = 1; l.name = L"腾讯文档"; l.path = L"https://docs.qq.com";
+    g_nodes = { t, l };
+    g_curTag = 1;
+    g_nextId = 3;
     for (auto& n : g_nodes) SaveNode(n);
     SaveNextId();
 }
@@ -209,7 +208,6 @@ static void LoadNodes() {
         GetPrivateProfileStringW(sec, L"name", L"", buf, 1024, g_iniLinks.c_str());   n.name = buf;
         GetPrivateProfileStringW(sec, L"path", L"", buf, 1024, g_iniLinks.c_str());   n.path = buf;
         GetPrivateProfileStringW(sec, L"params", L"", buf, 1024, g_iniLinks.c_str()); n.params = buf;
-        n.count = GetPrivateProfileIntW(sec, L"count", 0, g_iniLinks.c_str());
         g_nodes.push_back(n);
     }
     if (g_nodes.empty()) Seed();
@@ -218,26 +216,27 @@ static void LoadNodes() {
 // ---------------- 视图 ----------------
 static void RebuildView() {
     g_view.clear(); g_scroll = 0;
-    if (g_curGroup) {
-        for (auto& n : g_nodes) {
-            if (n.type != NT_LINK) continue;
-            bool show = (n.parent == g_curGroup);         // 直挂分组
-            if (!show) {                                  // 兼容旧数据：挂在标签下的链接
-                const Node* p = Find(n.parent);
-                show = p && p->type == NT_TAG && p->parent == g_curGroup;
-            }
-            if (show) g_view.push_back(&n);
-        }
+    for (auto& n : g_nodes) {
+        if (n.type != NT_LINK) continue;
+        if (g_curTag == 0 || n.parent == g_curTag) g_view.push_back(&n);
     }
-    if (g_sortByCount)
-        std::stable_sort(g_view.begin(), g_view.end(),
-                         [](const Node* a, const Node* b) { return a->count > b->count; });
 }
 
-static std::vector<Node*> GroupList() {
+static std::vector<Node*> TagList() {
     std::vector<Node*> v;
-    for (auto& n : g_nodes) if (n.type == NT_GROUP && n.parent == 0) v.push_back(&n);
+    for (auto& n : g_nodes) if (n.type == NT_TAG) v.push_back(&n);
     return v;
+}
+
+// 返回可挂链接的标签 id：优先当前标签，其次第一个标签；一个都没有就建"常用"
+static int EnsureCurTag() {
+    if (g_curTag) return g_curTag;
+    auto tl = TagList();
+    if (!tl.empty()) return tl[0]->id;
+    Node t; t.id = g_nextId++; t.type = NT_TAG; t.name = L"常用";
+    g_nodes.push_back(t); SaveNode(t); SaveNextId();
+    g_curTag = t.id;
+    return t.id;
 }
 
 static void Refresh() {
@@ -280,9 +279,6 @@ static void LaunchLink(Node* n, bool admin) {
     if (!n->params.empty()) sei.lpParameters = n->params.c_str();
     sei.nShow = SW_SHOWNORMAL;
     if (ShellExecuteExW(&sei)) {
-        Node* real = Find(n->id);
-        if (real) { real->count++; SaveNode(*real); }
-        Refresh();
         if (g_hideAfterLaunch) HideWin();
     } else if (GetLastError() != ERROR_CANCELLED) {
         MessageBoxW(g_hwnd, L"启动失败：路径可能已失效。", L"启动器", MB_OK | MB_ICONWARNING);
@@ -343,7 +339,6 @@ static void MakeFonts() {
 static void CreateGdiRes() {
     g_brWhite   = CreateSolidBrush(C_WHITE);
     g_brBg      = CreateSolidBrush(C_BG);
-    g_brGroupBg = CreateSolidBrush(C_GRPB);
     g_brHover   = CreateSolidBrush(C_HOVER);
     g_brSplit   = CreateSolidBrush(C_SPLIT);
     g_brAccent  = CreateSolidBrush(C_ACC);
@@ -358,7 +353,7 @@ static void FreeMemDC() {
 
 // ---------------- 布局与命中测试 ----------------
 static int TitleH() { return S(46); }
-static int GroupW() { return S(148); }
+static int TagH()   { return S(40); }
 static int CellW()  { return S(104); }
 static int CellH()  { return S(98); }
 static int Gap()    { return S(8); }
@@ -366,8 +361,8 @@ static int Gap()    { return S(8); }
 static void LayoutNow() {
     RECT rc; GetClientRect(g_hwnd, &rc);
     g_rcTitle = { 0, 0, rc.right, TitleH() };
-    g_rcGroup = { 0, TitleH(), GroupW(), rc.bottom };
-    g_rcGrid  = { GroupW(), TitleH(), rc.right, rc.bottom };
+    g_rcTag   = { 0, TitleH(), rc.right, TitleH() + TagH() };
+    g_rcGrid  = { 0, TitleH() + TagH(), rc.right, rc.bottom };
 
     // 标题栏按钮：0=关闭 1=菜单 2=钉住
     int b = S(34);
@@ -375,6 +370,24 @@ static void LayoutNow() {
         int x = g_rcTitle.right - S(10) - b * (i + 1) - S(2) * i;
         g_rcBtns[i] = { x, (TitleH() - b) / 2, x + b, (TitleH() + b) / 2 };
     }
+
+    // 标签宽度按文本实测
+    g_rcTabs.clear();
+    HDC dc = GetDC(g_hwnd);
+    HFONT of = (HFONT)SelectObject(dc, g_fUi);
+    auto tl = TagList();
+    int x = g_rcTag.left + Gap();
+    auto addTab = [&](const wchar_t* s) {
+        SIZE sz; GetTextExtentPoint32W(dc, s, (int)wcslen(s), &sz);
+        RECT r{ x, g_rcTag.top, x + sz.cx + S(24), g_rcTag.bottom };
+        g_rcTabs.push_back(r);
+        x = r.right;
+    };
+    addTab(L"全部");
+    for (auto* t : tl) addTab(t->name.c_str());
+    SelectObject(dc, of);
+    ReleaseDC(g_hwnd, dc);
+    g_rcAddTag = { g_rcTag.right - S(40), g_rcTag.top, g_rcTag.right, g_rcTag.bottom };
 
     // 网格列数与滚动范围
     int avail = g_rcGrid.right - g_rcGrid.left;
@@ -392,11 +405,6 @@ static RECT CellRect(int i) {
     return { x, y, x + CellW(), y + CellH() };
 }
 
-static RECT GroupItemRect(int i) {
-    return { 0, g_rcGroup.top + S(8) + i * S(36), g_rcGroup.right,
-             g_rcGroup.top + S(8) + (i + 1) * S(36) };
-}
-
 struct Hit { int reg = R_NONE; int idx = -1; };
 
 static Hit HitTest(POINT p) {
@@ -408,12 +416,10 @@ static Hit HitTest(POINT p) {
         h.reg = R_TITLE;
         return h;
     }
-    if (PtInRect(&g_rcGroup, p)) {
-        auto gl = GroupList();
-        for (int i = 0; i < (int)gl.size(); i++) {
-            RECT gr = GroupItemRect(i);
-            if (PtInRect(&gr, p)) { h.reg = R_GROUP; h.idx = i; return h; }
-        }
+    if (PtInRect(&g_rcTag, p)) {
+        if (PtInRect(&g_rcAddTag, p)) { h.reg = R_ADDTAG; return h; }
+        for (int i = 0; i < (int)g_rcTabs.size(); i++)
+            if (PtInRect(&g_rcTabs[i], p)) { h.reg = R_TAG; h.idx = i; return h; }
         return h;
     }
     if (PtInRect(&g_rcGrid, p)) {
@@ -449,7 +455,7 @@ static void EditorApply() {
         n.id = g_nextId++; n.type = g_ctx.type; n.parent = g_ctx.parent;
         n.name = g_ctx.name; n.path = g_ctx.path; n.params = g_ctx.params;
         g_nodes.push_back(n); SaveNode(n); SaveNextId();
-        if (n.type == NT_GROUP) g_curGroup = n.id;
+        if (n.type == NT_TAG) g_curTag = n.id;
     } else if (Node* n = Find(g_ctx.id)) {
         n->name = g_ctx.name; n->path = g_ctx.path; n->params = g_ctx.params;
         SaveNode(*n);
@@ -562,11 +568,8 @@ static int PopupMenuClient(HMENU m, POINT ptClient) {
 
 static void ShowMainMenu() {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, M_ADDGROUP, L"添加分组");
+    AppendMenuW(m, MF_STRING, M_ADDTAG, L"添加标签");
     AppendMenuW(m, MF_STRING, M_ADDLINK, L"添加链接");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_sortByCount ? 0 : MF_CHECKED), M_SORTMANUAL, L"排序：手动");
-    AppendMenuW(m, MF_STRING | (g_sortByCount ? MF_CHECKED : 0), M_SORTCOUNT, L"排序：按启动次数");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN, L"钉住");
     AppendMenuW(m, MF_STRING | (g_hideOnFocus ? MF_CHECKED : 0), M_HIDEFOCUS, L"失焦自动隐藏");
@@ -576,15 +579,8 @@ static void ShowMainMenu() {
     RECT r = g_rcBtns[1];
     int cmd = PopupMenuClient(m, { r.left, r.bottom + S(4) });
     switch (cmd) {
-    case M_ADDGROUP: OpenEditor(NT_GROUP, 0, nullptr); break;
-    case M_ADDLINK:
-        if (g_curGroup) OpenEditor(NT_LINK, g_curGroup, nullptr);
-        else MessageBoxW(g_hwnd, L"请先添加分组。", L"启动器", MB_OK | MB_ICONINFORMATION);
-        break;
-    case M_SORTMANUAL:
-    case M_SORTCOUNT:
-        g_sortByCount = (cmd == M_SORTCOUNT); SaveWinPos(); Refresh();
-        break;
+    case M_ADDTAG: OpenEditor(NT_TAG, 0, nullptr); break;
+    case M_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
     case M_PIN: g_pinned = !g_pinned; ApplyPin(); SaveWinPos(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     case M_HIDEFOCUS: g_hideOnFocus = !g_hideOnFocus; SaveWinPos(); break;
     case M_HOTKEY: OpenHotkeyDlg(); break;
@@ -612,30 +608,23 @@ static void ShowLinkMenu(Node* n, POINT scr) {
     case L_EDIT: OpenEditor(0, 0, n); break;
     case L_DEL:
         DeleteNodeCascade(n->id);
-        if (g_curGroup == n->id) {
-            auto gl = GroupList();
-            g_curGroup = gl.empty() ? 0 : gl[0]->id;
-        }
         Refresh();
         break;
     }
 }
 
-static void ShowGroupMenu(Node* grp, POINT scr) {
+static void ShowTagMenu(Node* tag, POINT scr) {
     HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, G_ADDLINK, L"添加链接");
+    AppendMenuW(m, MF_STRING, T_ADDLINK, L"添加链接");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, G_REN, L"重命名");
-    AppendMenuW(m, MF_STRING, G_DEL, L"删除");
+    AppendMenuW(m, MF_STRING, T_REN, L"重命名");
+    AppendMenuW(m, MF_STRING, T_DEL, L"删除");
     switch (PopupMenuScreen(m, scr)) {
-    case G_ADDLINK: OpenEditor(NT_LINK, grp->id, nullptr); break;
-    case G_REN: OpenEditor(0, 0, grp); break;
-    case G_DEL:
-        DeleteNodeCascade(grp->id);
-        if (g_curGroup == grp->id) {
-            auto gl = GroupList();
-            g_curGroup = gl.empty() ? 0 : gl[0]->id;
-        }
+    case T_ADDLINK: OpenEditor(NT_LINK, tag->id, nullptr); break;
+    case T_REN: OpenEditor(0, 0, tag); break;
+    case T_DEL:
+        DeleteNodeCascade(tag->id);
+        if (g_curTag == tag->id) g_curTag = 0;
         Refresh();
         break;
     }
@@ -644,8 +633,11 @@ static void ShowGroupMenu(Node* grp, POINT scr) {
 static void ShowGridBgMenu(POINT scr) {
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, BG_ADDLINK, L"添加链接");
-    if (g_curGroup && PopupMenuScreen(m, scr) == BG_ADDLINK)
-        OpenEditor(NT_LINK, g_curGroup, nullptr);
+    AppendMenuW(m, MF_STRING, BG_ADDTAG, L"添加标签");
+    switch (PopupMenuScreen(m, scr)) {
+    case BG_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
+    case BG_ADDTAG:  OpenEditor(NT_TAG, 0, nullptr); break;
+    }
 }
 
 // ---------------- 绘制 ----------------
@@ -682,7 +674,7 @@ static void EnableRoundedCorner(HWND h) {
 }
 
 static void PaintAll(HDC dc) {
-    auto gl = GroupList();
+    auto tl = TagList();
 
     // 标题栏：左=应用名，右=日期 + 关闭/菜单/钉住
     FillRect(dc, &g_rcTitle, g_brWhite);
@@ -705,31 +697,27 @@ static void PaintAll(HDC dc) {
         DrawGlyph(dc, g_rcBtns[i], glyphs[i], c);
     }
 
-    // 分组栏
-    FillRect(dc, &g_rcGroup, g_brGroupBg);
-    RECT lineG{ g_rcGroup.right - 1, g_rcGroup.top, g_rcGroup.right, g_rcGroup.bottom };
-    FillRect(dc, &lineG, g_brSplit);
-    for (int i = 0; i < (int)gl.size(); i++) {
-        RECT r = GroupItemRect(i);
-        RECT rr{ r.left + S(6), r.top, r.right - S(6), r.bottom };
-        bool sel = (gl[i]->id == g_curGroup);
-        bool hot = (g_hoverReg == R_GROUP && g_hoverIdx == i);
-        if (sel) FillRounded(dc, rr, g_brWhite, S(6));
-        else if (hot) FillRounded(dc, rr, g_brHover, S(6));
-        if (sel) { RECT bar{ rr.left, rr.top, rr.left + S(3), rr.bottom }; FillRounded(dc, bar, g_brAccent, S(3)); }
-        RECT tr{ rr.left + S(8), r.top, rr.right - S(6), r.bottom };
-        DrawTextRect(dc, tr, gl[i]->name.c_str(), sel ? g_fUiB : g_fUi,
+    // 标签栏
+    FillRect(dc, &g_rcTag, g_brWhite);
+    RECT lineTag{ 0, g_rcTag.bottom - 1, g_rcTag.right, g_rcTag.bottom };
+    FillRect(dc, &lineTag, g_brSplit);
+    for (int i = 0; i < (int)g_rcTabs.size(); i++) {
+        bool sel = (i == 0) ? (g_curTag == 0)
+                            : (i - 1 < (int)tl.size() && tl[i - 1]->id == g_curTag);
+        bool hot = (g_hoverReg == R_TAG && g_hoverIdx == i);
+        const wchar_t* txt = (i == 0) ? L"全部" : tl[i - 1]->name.c_str();
+        DrawTextRect(dc, g_rcTabs[i], txt, sel ? g_fUiB : g_fUi,
                      sel ? C_ACC : (hot ? C_TEXT : C_MUT),
-                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (sel) { RECT bar{ g_rcTabs[i].left, g_rcTag.bottom - S(3),
+                             g_rcTabs[i].right, g_rcTag.bottom - 1 }; FillRounded(dc, bar, g_brAccent, S(3)); }
     }
-    if (gl.empty())
-        DrawTextRect(dc, g_rcGroup, L"右键\n添加分组", g_fSmall, C_MUT,
-                     DT_CENTER | DT_VCENTER | DT_WORDBREAK);
+    DrawGlyph(dc, g_rcAddTag, 0xE710, (g_hoverReg == R_ADDTAG) ? C_TEXT : C_MUT);
 
     // 网格
     FillRect(dc, &g_rcGrid, g_brBg);
     if (g_view.empty()) {
-        const wchar_t* hint = g_curGroup ? L"右键空白处添加链接，或直接拖入文件" : L"右键添加分组";
+        const wchar_t* hint = g_curTag ? L"右键空白处添加链接，或直接拖入文件" : L"右键添加标签";
         DrawTextRect(dc, g_rcGrid, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
         for (int i = 0; i < (int)g_view.size(); i++) {
@@ -748,18 +736,13 @@ static void PaintAll(HDC dc) {
                      r.top + S(14) + isz + S(6) + S(18) };
             DrawTextRect(dc, nr, g_view[i]->name.c_str(), g_fUi, C_TEXT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            if (g_view[i]->count > 0) {
-                wchar_t cb[24]; wsprintfW(cb, L"%d次", g_view[i]->count);
-                RECT cr{ nr.left, nr.bottom, nr.right, nr.bottom + S(16) };
-                DrawTextRect(dc, cr, cb, g_fSmall, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-            }
         }
     }
 }
 
 // ---------------- 交互辅助 ----------------
-static void SelectGroup(int id) {
-    g_curGroup = id;
+static void SelectTag(int id) {
+    g_curTag = id;
     Refresh();
 }
 
@@ -964,7 +947,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (LOWORD(l) == HTCLIENT) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
             Hit hh = HitTest(pt);
-            bool hand = hh.reg == R_CELL || hh.reg == R_GROUP ||
+            bool hand = hh.reg == R_CELL || hh.reg == R_TAG || hh.reg == R_ADDTAG ||
                         (hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN);
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
@@ -988,9 +971,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_pinned = !g_pinned; ApplyPin(); SaveWinPos();
             InvalidateRect(h, nullptr, FALSE);
             break;
-        case R_GROUP: {
-            auto gl = GroupList();
-            if (hh.idx < (int)gl.size()) SelectGroup(gl[hh.idx]->id);
+        case R_ADDTAG:
+            OpenEditor(NT_TAG, 0, nullptr);
+            break;
+        case R_TAG: {
+            auto tl = TagList();
+            if (hh.idx == 0) g_curTag = 0;
+            else if (hh.idx - 1 < (int)tl.size()) g_curTag = tl[hh.idx - 1]->id;
+            Refresh();
             break;
         }
         }
@@ -1004,12 +992,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         Hit hh = HitTest(pt);
         switch (hh.reg) {
         case R_CELL: ShowLinkMenu(const_cast<Node*>(g_view[hh.idx]), scr); break;
-        case R_GROUP: {
-            auto gl = GroupList();
-            if (hh.idx < (int)gl.size()) ShowGroupMenu(gl[hh.idx], scr);
-            else ShowGridBgMenu(scr);
+        case R_TAG: {
+            auto tl = TagList();
+            if (hh.idx >= 1 && hh.idx - 1 < (int)tl.size()) ShowTagMenu(tl[hh.idx - 1], scr);
             break;
         }
+        case R_ADDTAG: ShowGridBgMenu(scr); break;
         case R_TITLE: ShowMainMenu(); break;
         default: ShowGridBgMenu(scr); break;
         }
@@ -1017,7 +1005,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_DROPFILES: {                                  // 拖入文件/文件夹 → 追加为链接
         HDROP d = (HDROP)w;
-        int parent = g_curGroup;
+        int parent = EnsureCurTag();
         UINT n = parent ? DragQueryFileW(d, 0xFFFFFFFF, nullptr, 0) : 0;
         for (UINT i = 0; i < n; i++) {
             wchar_t p[1024];
@@ -1081,7 +1069,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         FreeMemDC();
         for (auto& kv : g_icons) if (kv.second) DestroyIcon(kv.second);
         FreeGdiRes();
-        DeleteObject(g_brWhite); DeleteObject(g_brBg); DeleteObject(g_brGroupBg);
+        DeleteObject(g_brWhite); DeleteObject(g_brBg);
         DeleteObject(g_brHover); DeleteObject(g_brSplit); DeleteObject(g_brAccent);
         DeleteObject(g_penSplit); DeleteObject(g_penAccent);
         PostQuitMessage(0);
@@ -1121,7 +1109,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     g_hideOnFocus      = GetPrivateProfileIntW(L"behavior", L"hideOnFocus", 1, g_iniConf.c_str()) != 0;
     g_hideAfterLaunch  = GetPrivateProfileIntW(L"behavior", L"hideAfterLaunch", 1, g_iniConf.c_str()) != 0;
-    g_sortByCount      = GetPrivateProfileIntW(L"ui", L"sortByCount", 0, g_iniConf.c_str()) != 0;
     g_pinned           = GetPrivateProfileIntW(L"ui", L"pinned", 0, g_iniConf.c_str()) != 0;
     g_startHidden      = GetPrivateProfileIntW(L"behavior", L"startHidden", 0, g_iniConf.c_str()) != 0;
     int wx = GetPrivateProfileIntW(L"ui", L"x", -32000, g_iniConf.c_str());
@@ -1130,10 +1117,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     int wh = std::max(S(340), (int)GetPrivateProfileIntW(L"ui", L"h", S(460), g_iniConf.c_str()));
 
     LoadNodes();
-    {
-        auto gl = GroupList();
-        g_curGroup = gl.empty() ? 0 : gl[0]->id;
-    }
 
     WNDCLASSEXW wc = { sizeof wc };
     wc.style = CS_HREDRAW | CS_VREDRAW;
@@ -1166,9 +1149,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     CreateGdiRes();
 
     RECT wr{ 0, 0, ww, wh };
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    // 无 WS_CAPTION：彻底杜绝系统标题栏；缩放/动画由 WS_THICKFRAME + WM_NCHITTEST 提供
+    const DWORD winStyle = WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX;
+    AdjustWindowRect(&wr, winStyle, FALSE);
     g_hwnd = CreateWindowExW(0, MAIN_CLASS, L"启动面板",
-                             WS_OVERLAPPEDWINDOW,
+                             winStyle,
                              wx == -32000 ? CW_USEDEFAULT : wx,
                              wy == -32000 ? CW_USEDEFAULT : wy,
                              wr.right - wr.left, wr.bottom - wr.top,
