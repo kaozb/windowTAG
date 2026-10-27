@@ -48,7 +48,7 @@ struct Node {
 
 // 菜单命令 ID
 enum {
-    M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT,
+    M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT, M_LISTEN,
     M_ICON0 = 111, M_ICON1, M_ICON2,              // 图标 小/中/大
     M_SORT0 = 121, M_SORT1, M_SORT2,               // 排序 添加顺序/名称升/名称降
     M_THEME0 = 131, M_THEME1,                      // 主题 深色/浅色
@@ -1073,6 +1073,7 @@ static void ShowMainMenu() {
     MAdd(m, M_PIN, g_pinned ? L"取消钉住" : L"钉住", g_pinned);
     MAdd(m, M_HIDEFOCUS, L"失焦自动隐藏", g_hideOnFocus);
     MAdd(m, M_HOTKEY, L"快捷键设置…");
+    MAdd(m, M_LISTEN, L"监听设置…");
     MSep(m);
     MAdd(m, M_EXIT, L"退出");
     RECT r = g_rcBtns[1];
@@ -1085,6 +1086,7 @@ static void ShowMainMenu() {
     case M_PIN: g_pinned = !g_pinned; ApplyPin(); SaveWinPos(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     case M_HIDEFOCUS: g_hideOnFocus = !g_hideOnFocus; SaveWinPos(); break;
     case M_HOTKEY: OpenHotkeyDlg(); break;
+    case M_LISTEN: OpenListenDlg(); break;
     case M_EXIT: Quit(); break;
     default:
         if (cmd >= M_ICON0 && cmd <= M_ICON2) {
@@ -1547,9 +1549,9 @@ static std::string WideToUtf8(const std::wstring& w) {
     return s;
 }
 
-// 宽松解析 {"msg":"XXXX"}：取到 msg 字符串值即成功（支持常规转义）
+// 宽松解析 {"msg":"XXXX"}：取到 msg 字符串值即成功（支持常规转义，容忍 UTF-8 BOM）
 static bool ParseMsgJson(const std::wstring& body, std::wstring& out) {
-    size_t i = body.find_first_not_of(L" \t\r\n");
+    size_t i = body.find_first_not_of(L" \t\r\n\xFEFF");
     if (i == std::wstring::npos || body[i] != L'{') return false;
     size_t k = body.find(L"\"msg\"", i);
     if (k == std::wstring::npos) return false;
@@ -1643,6 +1645,8 @@ static void HandleClient(SOCKET c, DWORD peer, const std::wstring& allow) {
         if (hdrEnd != std::string::npos) {
             std::string low = req.substr(0, hdrEnd);
             for (char& ch : low) ch = (char)tolower((unsigned char)ch);
+            if (low.find("expect: 100-continue") != std::string::npos)
+                send(c, "HTTP/1.1 100 Continue\r\n\r\n", 25, 0);   // 大消息 curl 会先等这个
             int cl = 0;
             size_t p = low.find("content-length:");
             if (p != std::string::npos) cl = atoi(low.c_str() + p + 15);
@@ -1673,9 +1677,17 @@ static void HandleClient(SOCKET c, DWORD peer, const std::wstring& allow) {
         wchar_t* heap = new wchar_t[msg.size() + 1];
         wmemcpy(heap, msg.c_str(), msg.size() + 1);
         PostMessageW(g_hwnd, WM_MSG, 0, (LPARAM)heap);
-    } else {
+    } else if (!IpAllowed(wip, allow)) {
+        char tip[128];                                        // 与格式错误分开：被白名单拦下要能一眼看出
+        snprintf(tip, sizeof tip, "来源 IP %s 不在允许的前缀内", ip);
+        SendHttp(c, 403, "Forbidden", tip);
+    } else if (body.empty()) {
         SendHttp(c, 400, "Bad Request",
-                 WideToUtf8(L"请按照 {\"msg\":\"XXXXX\"}这个格式发送"));
+                 WideToUtf8(L"未读到请求体。请按照 {\"msg\":\"XXXXX\"}这个格式发送"));
+    } else {
+        std::string r = "收到: " + body.substr(0, 120) +
+                        " 。请按照 {\"msg\":\"XXXXX\"}这个格式发送";   // 回显便于发现客户端转义/引号问题
+        SendHttp(c, 400, "Bad Request", r);
     }
     closesocket(c);
 }
@@ -1698,18 +1710,33 @@ static void SaveListenCfg() {
     WritePrivateProfileStringW(L"listen", L"allow", g_listenAllow.c_str(), g_iniConf.c_str());
 }
 
+// 托盘气泡提示（随机端口、启动失败等关键反馈；副本方式不污染 g_nid）
+static void TrayTip(const wchar_t* msg) {
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    lstrcpynW(n.szInfo, msg, 256);
+    lstrcpynW(n.szInfoTitle, L"消息监听", 64);
+    n.dwInfoFlags = NIIF_INFO;
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
 static bool StartListener() {
     if (g_listenOn) return true;
     if (!g_wsaOk) {
         WSADATA d;
         if (WSAStartup(MAKEWORD(2, 2), &d) != 0) {
             g_listenStatus = L"网络初始化失败";
+            TrayTip(L"监听启动失败：网络初始化失败");
             return false;
         }
         g_wsaOk = true;
     }
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) { g_listenStatus = L"创建套接字失败"; return false; }
+    if (s == INVALID_SOCKET) {
+        g_listenStatus = L"创建套接字失败";
+        TrayTip(L"监听启动失败：创建套接字失败");
+        return false;
+    }
     BOOL reuse = TRUE;
     setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof reuse);
     sockaddr_in a{};
@@ -1719,6 +1746,7 @@ static bool StartListener() {
     if (bind(s, (sockaddr*)&a, sizeof a) != 0) {
         closesocket(s);
         g_listenStatus = g_listenPort ? L"启动失败：端口被占用" : L"启动失败";
+        TrayTip(g_listenPort ? L"监听启动失败：端口被占用" : L"监听启动失败");
         return false;
     }
     listen(s, 8);
@@ -1728,8 +1756,9 @@ static bool StartListener() {
     g_listenOn = true;
     g_listenThread = CreateThread(nullptr, 0, ListenThread, nullptr, 0, nullptr);
     wchar_t b[64];
-    wsprintfW(b, L"监听中 · 端口 %d", g_listenActual);
+    wsprintfW(b, L"监听已启动，端口 %d", g_listenActual);
     g_listenStatus = b;
+    TrayTip(b);                                            // 随机端口必须告知
     InvalidateRect(g_hwnd, nullptr, FALSE);                // 播放按钮点亮
     return true;
 }
@@ -1848,8 +1877,10 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_hPort = edit(x + lw, S(46), S(140), pb, IDC_PORT);
         label(L"允许IP前缀", x, S(88) + S(5));
         g_hAllow = edit(x + lw, S(88), fw, g_listenAllow.c_str(), IDC_ALLOW);
+        g_dlgBtns.push_back({ { S(380) - x - S(88) * 2 - S(8), S(158), S(380) - x - S(88) - S(8), S(158) + S(28) },
+                              IDOK, L"确定", true });
         g_dlgBtns.push_back({ { S(380) - x - S(88), S(158), S(380) - x, S(158) + S(28) },
-                              IDOK, g_listenOn ? L"停止监听" : L"启动监听", true });
+                              IDCANCEL, L"取消", false });
         g_rcDlgX = { S(380) - S(40), 0, S(380) - S(8), S(36) };
         return 0;
     }
@@ -1881,7 +1912,7 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         if (PtInRect(&g_rcDlgX, pt)) { DestroyWindow(h); return 0; }
-        if (FindDlgBtn(pt)) { SendMessageW(h, WM_COMMAND, IDOK, 0); return 0; }
+        if (const DlgBtn* b = FindDlgBtn(pt)) { SendMessageW(h, WM_COMMAND, b->id, 0); return 0; }
         if (pt.y < S(36)) {
             ReleaseCapture();
             SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
@@ -1902,11 +1933,6 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_COMMAND:
         if (LOWORD(w) == IDOK) {
-            if (g_listenOn) {
-                StopListener();
-                DestroyWindow(h);
-                return 0;
-            }
             wchar_t b[512];
             GetWindowTextW(g_hPort, b, 64);
             int p = _wtoi(b);
@@ -1919,10 +1945,14 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_listenAllow = b;
             g_listenPort = p;
             SaveListenCfg();
-            if (StartListener()) DestroyWindow(h);         // 启动成功即收起
-            else InvalidateRect(h, nullptr, TRUE);         // 失败：状态行给出原因
+            if (g_listenOn) {                              // 改配置立即生效：按新配置重启
+                StopListener();
+                StartListener();
+            }
+            DestroyWindow(h);
             return 0;
         }
+        if (LOWORD(w) == IDCANCEL) { DestroyWindow(h); return 0; }
         break;
     case WM_CLOSE: DestroyWindow(h); return 0;
     case WM_NCDESTROY:
@@ -1936,11 +1966,17 @@ static void OpenListenDlg() {
     if (g_hLstn) { SetForegroundWindow(g_hLstn); return; }
     if (g_hDlg) DestroyWindow(g_hDlg);                     // 按钮数组全局共享，禁止对话框并发
     if (g_hHK) DestroyWindow(g_hHK);
-    if (!g_listenOn) g_listenStatus = L"端口留空 = 随机端口；前缀留空 = 允许所有来源";
+    if (g_listenOn) {
+        wchar_t b[96];
+        wsprintfW(b, L"监听中 · 端口 %d · 修改后点确定将重启监听", g_listenActual);
+        g_listenStatus = b;
+    } else {
+        g_listenStatus = L"未监听 · 端口留空 = 随机端口；前缀留空 = 允许所有来源";
+    }
     int cw = S(380), ch = S(202);
     RECT mr{};
     if (g_hwnd) GetWindowRect(g_hwnd, &mr);
-    g_hLstn = CreateWindowExW(0, LSTN_CLASS, L"消息监听", WS_POPUP,
+    g_hLstn = CreateWindowExW(0, LSTN_CLASS, L"监听设置", WS_POPUP,
                               mr.left + ((mr.right - mr.left) - cw) / 2,
                               mr.top + ((mr.bottom - mr.top) - ch) / 2,
                               cw, ch, g_hwnd, nullptr, g_hInst, nullptr);
@@ -2079,7 +2115,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             break;
         case R_BTN_PLAY:
-            OpenListenDlg();
+            if (g_listenOn) StopListener(); else StartListener();  // 纯开关；设置在主菜单
             break;
         case R_ADDTAG:
             OpenEditor(NT_TAG, 0, nullptr);
