@@ -360,6 +360,7 @@ static int EnsureCurTag() {
     if (!tl.empty()) return tl[0]->id;
     Node t; t.id = g_nextId++; t.type = NT_TAG; t.name = L"常用"; t.order = (int)g_nodes.size();
     g_nodes.push_back(t); SaveNode(t); SaveNextId();
+    Refresh();                                           // push_back 可能扩容挪动 g_nodes，g_view 指针须重建
     g_curTag = t.id;
     return t.id;
 }
@@ -1728,7 +1729,7 @@ static void HandleClient(SOCKET c, DWORD peer, const std::wstring& allow) {
         SendHttp(c, 200, "OK", "OK");
         wchar_t* heap = new wchar_t[msg.size() + 1];
         wmemcpy(heap, msg.c_str(), msg.size() + 1);
-        PostMessageW(g_hwnd, WM_MSG, 0, (LPARAM)heap);
+        if (!PostMessageW(g_hwnd, WM_MSG, 0, (LPARAM)heap)) delete[] heap;   // 窗口已销毁等场景不丢不漏
     } else if (!IpAllowed(wip, allow)) {
         char tip[128];                                        // 与格式错误分开：被白名单拦下要能一眼看出
         snprintf(tip, sizeof tip, "来源 IP %s 不在允许的前缀内", ip);
@@ -1744,12 +1745,13 @@ static void HandleClient(SOCKET c, DWORD peer, const std::wstring& allow) {
     closesocket(c);
 }
 
-static DWORD WINAPI ListenThread(LPVOID) {
+static DWORD WINAPI ListenThread(LPVOID p) {
+    SOCKET srv = (SOCKET)(INT_PTR)p;                       // 本线程专属：Stop 超时后重新 Start 也不会摸到新 socket
     std::wstring allow = g_listenAllow;                    // 启动时快照
     while (g_listenOn) {
         sockaddr_in ca{};
         int cl = sizeof ca;
-        SOCKET c = accept(g_srvSock, (sockaddr*)&ca, &cl);
+        SOCKET c = accept(srv, (sockaddr*)&ca, &cl);
         if (c == INVALID_SOCKET) break;                    // 停止 = closesocket 唤醒
         HandleClient(c, ca.sin_addr.S_un.S_addr, allow);
     }
@@ -1808,7 +1810,7 @@ static bool StartListener() {
     g_listenActual = (getsockname(s, (sockaddr*)&got, &gl) == 0) ? ntohs(got.sin_port) : 0;
     g_srvSock = s;
     g_listenOn = true;
-    g_listenThread = CreateThread(nullptr, 0, ListenThread, nullptr, 0, nullptr);
+    g_listenThread = CreateThread(nullptr, 0, ListenThread, (LPVOID)(INT_PTR)s, 0, nullptr);
     wchar_t b[64];
     wsprintfW(b, L"监听已启动，端口 %d", g_listenActual);
     g_listenStatus = b;
@@ -2142,15 +2144,22 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         Hit hh = HitTest(pt);
         if (g_pressIdx >= 0) {                            // 按住左键：先判定拖拽，松手未拖则按单击处理
+            bool changed = false;
             if (!g_dragging &&
-                (abs(pt.x - g_pressPt.x) > S(6) || abs(pt.y - g_pressPt.y) > S(6)))
+                (abs(pt.x - g_pressPt.x) > S(6) || abs(pt.y - g_pressPt.y) > S(6))) {
                 g_dragging = (g_sortMode == 0);           // 名称排序下拖不出可见效果，禁用拖拽
+                changed = g_dragging;
+            }
             if (g_dragging && hh.reg == R_CELL && hh.idx != g_pressIdx) {
                 DragMove(g_pressIdx, hh.idx);             // 实时换位
                 g_pressIdx = hh.idx;
+                changed = true;
             }
-            if (g_dragging) { g_hoverReg = R_CELL; g_hoverIdx = g_pressIdx; }
-            InvalidateRect(h, nullptr, FALSE);
+            if (g_dragging && (g_hoverReg != R_CELL || g_hoverIdx != g_pressIdx)) {
+                g_hoverReg = R_CELL; g_hoverIdx = g_pressIdx;
+                changed = true;
+            }
+            if (changed) InvalidateRect(h, nullptr, FALSE);   // 只在画面真变化时重绘，拖拽不空转 GPU/CPU
             break;
         }
         if (hh.reg != g_hoverReg || hh.idx != g_hoverIdx) {
@@ -2348,6 +2357,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (already) {
         HWND h = FindWindowW(MAIN_CLASS, nullptr);
         if (h) { ShowWindow(h, SW_SHOW); SetForegroundWindow(h); }
+        CloseHandle(mutex);
+        gp::GdiplusShutdown(g_gdipToken);
         return 0;
     }
 
