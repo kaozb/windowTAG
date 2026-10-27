@@ -357,6 +357,7 @@ static void FadeIn(HWND h, int ms) {
         SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) | WS_EX_LAYERED);
         SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
         ShowWindow(h, SW_SHOW);
+        UpdateWindow(h);                 // 首帧先画完再提 alpha：否则会闪一帧未绘制/系统底色
     }
     for (int i = 1; i <= 8; i++) {
         SetLayeredWindowAttributes(h, 0, (BYTE)(255 * i / 8), LWA_ALPHA);
@@ -641,6 +642,8 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_NCACTIVATE:
         return DefWindowProcW(h, m, w, -1);
+    case WM_ERASEBKGND:                                   // 自己整面重绘，禁止系统用类底色擦除（白色闪一下）
+        return 1;
     case WM_CTLCOLOREDIT: {
         HDC dc = (HDC)w;
         SetBkColor(dc, C_INSET); SetTextColor(dc, C_TEXT);
@@ -1141,6 +1144,8 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_NCACTIVATE:
         return DefWindowProcW(h, m, w, -1);
+    case WM_ERASEBKGND:                                   // 同编辑弹窗：避免系统底色闪一帧
+        return 1;
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
         bool big = (HWND)l && GetDlgCtrlID((HWND)l) == 1;      // 键值预览：加粗主色
@@ -1527,7 +1532,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     dc.lpfnWndProc = DlgProc;
     dc.hInstance = hInst;
     dc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    dc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    dc.hbrBackground = nullptr;
     dc.lpszClassName = DLG_CLASS;
     RegisterClassW(&dc);
 
@@ -1535,7 +1540,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     hk.lpfnWndProc = HKProc;
     hk.hInstance = hInst;
     hk.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    hk.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    hk.hbrBackground = nullptr;
     hk.lpszClassName = HK_CLASS;
     RegisterClassW(&hk);
 
