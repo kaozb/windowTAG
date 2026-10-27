@@ -8,5 +8,5 @@ cl /nologo /utf-8 /W3 /O1 /GL /Gy /Gw /MT /EHs-c- /GR- /DUNICODE /D_UNICODE /D_W
   src\main.cpp build\res.res ^
   /Fe:dist\Launcher-x64.exe ^
   /link /LTCG /OPT:REF /OPT:ICF /SUBSYSTEM:WINDOWS ^
-  user32.lib gdi32.lib shell32.lib comdlg32.lib
+  user32.lib gdi32.lib gdiplus.lib shell32.lib comdlg32.lib ws2_32.lib
 echo 输出: dist\Launcher-x64.exe

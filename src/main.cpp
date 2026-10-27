@@ -15,6 +15,8 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <windowsx.h>
 #include <shellapi.h>
@@ -24,15 +26,20 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cwctype>
 #include "version.h"
+
+#pragma comment(lib, "ws2_32.lib")
 
 namespace gp = Gdiplus;
 
 // ---------------- 数据模型 ----------------
 enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2 };
-enum { R_NONE = 0, R_TITLE, R_TAG, R_ADDTAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN };
+enum { R_NONE = 0, R_TITLE, R_TAG, R_ADDTAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN, R_BTN_PLAY };
 
 struct Node {
     int id = 0, type = 0, parent = 0;
@@ -52,12 +59,13 @@ enum {
 };
 
 // 编辑框控件 ID
-enum { IDC_NAME = 1001, IDC_PATH, IDC_PARAMS, IDC_BROWSE };
+enum { IDC_NAME = 1001, IDC_PATH, IDC_PARAMS, IDC_BROWSE, IDC_PORT, IDC_ALLOW };
 
 // ---------------- 全局状态 ----------------
 static const wchar_t MAIN_CLASS[] = L"LNP_MainWnd";
 static const wchar_t DLG_CLASS[]  = L"LNP_EditWnd";
 static const UINT    WM_TRAY = WM_APP + 1;
+static const UINT    WM_MSG  = WM_APP + 2;   // 监听线程 → 主线程：弹出消息框
 
 static HINSTANCE g_hInst;
 static HWND      g_hwnd, g_hDlg, g_hName, g_hPath, g_hParams;
@@ -83,12 +91,26 @@ static NOTIFYICONDATAW g_nid = {};
 static RECT g_rcTitle, g_rcTag, g_rcGrid;
 static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
 static RECT g_rcAddTag;
-static RECT g_rcBtns[3];             // 0=关闭 1=菜单 2=钉住
+static RECT g_rcBtns[4];             // 0=关闭 1=菜单 2=钉住 3=播放
 static RECT g_rcDlgX;                // 编辑对话框右上角关闭区
 struct DlgBtn { RECT rc; int id; const wchar_t* txt; bool primary; };
 static std::vector<DlgBtn> g_dlgBtns;
 static std::vector<RECT>   g_dlgEdits;
 static HWND g_hHK = nullptr;         // 热键对话框（编辑对话框句柄见 g_hDlg）
+
+// 消息监听（HTTP）与屏幕弹框
+static const wchar_t LSTN_CLASS[]  = L"LNP_ListenWnd";
+static const wchar_t TOAST_CLASS[] = L"LNP_MsgWnd";
+static HWND g_hLstn = nullptr, g_hPort = nullptr, g_hAllow = nullptr, g_hToast = nullptr;
+static int  g_listenPort = 0;            // 配置端口，0 = 随机
+static std::wstring g_listenAllow;       // 允许来源 IP 前缀（逗号分隔，空 = 不限）
+static std::atomic<bool> g_listenOn{ false };
+static int  g_listenActual = 0;          // 实际绑定端口
+static std::wstring g_listenStatus;      // 监听对话框状态行
+static SOCKET g_srvSock = INVALID_SOCKET;
+static HANDLE g_listenThread = nullptr;
+static bool   g_wsaOk = false;
+static std::wstring g_msgText;           // 弹框当前文本
 // GDI 资源
 static HFONT g_fUi, g_fUiB, g_fSmall, g_fGlyph, g_fTitle;
 static HBRUSH g_brBg, g_brCard, g_brInset;
@@ -138,6 +160,8 @@ static void OpenEditor(int type, int parent, const Node* src);
 static void HideWin();
 static void ShowMainMenu();
 static void OpenHotkeyDlg();
+static void OpenListenDlg();
+static void StopListener();
 
 // ---------------- 基础工具 ----------------
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -178,6 +202,7 @@ static void SaveWinPos() {
 }
 
 static void Quit() {
+    StopListener();
     SaveWinPos();
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     DestroyWindow(g_hwnd);
@@ -355,11 +380,11 @@ static void ApplyPin() {
 
 // 手动 layered alpha 淡入淡出：AnimateWindow 临时增删 WS_EX_LAYERED 会触发 NC 重排，
 // 偶尔闪出一帧系统老边框；直接操纵 alpha 无此副作用（短 Sleep 在显示/隐藏场景无感）
-static void FadeIn(HWND h, int ms) {
+static void FadeIn(HWND h, int ms, UINT show = SW_SHOW) {
     if (!IsWindowVisible(h)) {
         SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) | WS_EX_LAYERED);
         SetLayeredWindowAttributes(h, 0, 0, LWA_ALPHA);
-        ShowWindow(h, SW_SHOW);
+        ShowWindow(h, show);
         UpdateWindow(h);                 // 首帧先画完再提 alpha：否则会闪一帧未绘制/系统底色
     }
     for (int i = 1; i <= 8; i++) {
@@ -452,9 +477,9 @@ static void LayoutNow() {
     g_rcTag   = { 0, TitleH(), rc.right, TitleH() + TagH() };
     g_rcGrid  = { 0, TitleH() + TagH(), rc.right, rc.bottom };
 
-    // 标题栏按钮：0=关闭 1=菜单 2=钉住
+    // 标题栏按钮：0=关闭 1=菜单 2=钉住 3=播放
     int b = S(34);
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         int x = g_rcTitle.right - S(10) - b * (i + 1) - S(2) * i;
         g_rcBtns[i] = { x, (TitleH() - b) / 2, x + b, (TitleH() + b) / 2 };
     }
@@ -501,7 +526,7 @@ static Hit HitTest(POINT p) {
     Hit h;
     if (g_rcBtns[0].right == 0) return h;
     if (PtInRect(&g_rcTitle, p)) {
-        for (int i = 0; i < 3; i++)
+        for (int i = 0; i < 4; i++)
             if (PtInRect(&g_rcBtns[i], p)) { h.reg = R_BTN_CLOSE + i; return h; }
         h.reg = R_TITLE;
         return h;
@@ -707,7 +732,8 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void OpenEditor(int type, int parent, const Node* src) {
     if (g_hDlg) { SetForegroundWindow(g_hDlg); return; }
-    if (g_hHK) DestroyWindow(g_hHK);   // 按钮数组全局共享，禁止两个对话框并发
+    if (g_hHK) DestroyWindow(g_hHK);       // 按钮数组全局共享，禁止对话框并发
+    if (g_hLstn) DestroyWindow(g_hLstn);
     g_ctx = EditCtx();
     g_ctx.isNew = !src;
     if (src) {
@@ -1279,18 +1305,19 @@ static void PaintAll(HDC dc) {
     }
     SYSTEMTIME st; GetLocalTime(&st);
     wchar_t db[32]; wsprintfW(db, L"%d月%d日", st.wMonth, st.wDay);
-    RECT dr{ 0, 0, g_rcBtns[2].left - S(6), g_rcTitle.bottom };
+    RECT dr{ 0, 0, g_rcBtns[3].left - S(6), g_rcTitle.bottom };
     DrawTextRect(dc, dr, db, g_fUi, C_MUT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-    const wchar_t glyphs[3] = { 0xE711, 0xE700, 0xE718 };   // 关闭 菜单 钉住
-    for (int i = 0; i < 3; i++) {
+    const wchar_t glyphs[4] = { 0xE711, 0xE700, 0xE718, 0xE768 };   // 关闭 菜单 钉住 播放
+    for (int i = 0; i < 4; i++) {
+        bool sticky = (i == 2 && g_pinned) || (i == 3 && g_listenOn);
         bool hot = (g_hoverReg == R_BTN_CLOSE + i);
-        if (hot && !(i == 2 && g_pinned)) {
+        if (hot && !sticky) {
             GdipFillRound(g, g_rcBtns[i], S(9), C_CARD, 255);
             GdipStrokeRound(g, g_rcBtns[i], S(9), C_SPLIT, 120, 1.0f);
         }
         COLORREF c = C_MUT;
-        if (i == 2 && g_pinned) {                             // 已钉住：主色胶囊 + 深色图钉，一眼可辨
-            GdipFillRound(g, g_rcBtns[2], S(9), C_ACC, 255);
+        if (sticky) {                                         // 钉住/监听中：主色胶囊，一眼可辨
+            GdipFillRound(g, g_rcBtns[i], S(9), C_ACC, 255);
             c = C_ONTXT;
         } else if (hot) {
             c = C_TEXT;
@@ -1496,7 +1523,8 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
 static void OpenHotkeyDlg() {
     if (g_hHK) { SetForegroundWindow(g_hHK); return; }
-    if (g_hDlg) DestroyWindow(g_hDlg);   // 按钮数组全局共享，禁止两个对话框并发
+    if (g_hDlg) DestroyWindow(g_hDlg);     // 按钮数组全局共享，禁止对话框并发
+    if (g_hLstn) DestroyWindow(g_hLstn);
     int cw = S(300), ch = S(156);
     RECT mr{};
     if (g_hwnd) GetWindowRect(g_hwnd, &mr);
@@ -1508,6 +1536,397 @@ static void OpenHotkeyDlg() {
         EnableRoundedCorner(g_hHK, C_EDGE);
         ApplyRoundRegion(g_hHK, true);
         FadeIn(g_hHK, 120);
+    }
+}
+
+// ---------------- 消息监听（HTTP → 屏幕弹框） ----------------
+static std::string WideToUtf8(const std::wstring& w) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s(n, 0);
+    if (n) WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+// 宽松解析 {"msg":"XXXX"}：取到 msg 字符串值即成功（支持常规转义）
+static bool ParseMsgJson(const std::wstring& body, std::wstring& out) {
+    size_t i = body.find_first_not_of(L" \t\r\n");
+    if (i == std::wstring::npos || body[i] != L'{') return false;
+    size_t k = body.find(L"\"msg\"", i);
+    if (k == std::wstring::npos) return false;
+    k = body.find(L':', k + 5);
+    if (k == std::wstring::npos) return false;
+    k = body.find_first_not_of(L" \t\r\n", k + 1);
+    if (k == std::wstring::npos || body[k] != L'"') return false;
+    k++;
+    while (k < body.size()) {
+        wchar_t ch = body[k++];
+        if (ch == L'"') return true;
+        if (ch != L'\\') { out += ch; continue; }
+        if (k >= body.size()) return false;
+        wchar_t e = body[k++];
+        switch (e) {
+        case L'"':  out += L'"';  break;
+        case L'\\': out += L'\\'; break;
+        case L'/':  out += L'/';  break;
+        case L'n':  out += L'\n'; break;
+        case L'r':  out += L'\r'; break;
+        case L't':  out += L'\t'; break;
+        case L'b':  out += L'\b'; break;
+        case L'f':  out += L'\f'; break;
+        case L'u': {
+            if (k + 4 > body.size()) return false;
+            int v = 0;
+            for (int j = 0; j < 4; j++) {
+                wchar_t hc = body[k++];
+                v <<= 4;
+                if (hc >= L'0' && hc <= L'9')      v += hc - L'0';
+                else if (hc >= L'a' && hc <= L'f') v += hc - L'a' + 10;
+                else if (hc >= L'A' && hc <= L'F') v += hc - L'A' + 10;
+                else return false;
+            }
+            out += (wchar_t)v;
+            break;
+        }
+        default: return false;
+        }
+    }
+    return false;
+}
+
+// 来源 IP 前缀白名单：allow 空 = 全放行；前缀按 , ， ; ； 空格 分隔，对点分十进制 IP 字面前缀匹配
+static bool IpAllowed(const wchar_t* ip, const std::wstring& allow) {
+    if (allow.empty()) return true;
+    size_t i = 0;
+    while (i < allow.size()) {
+        size_t j = i;
+        while (j < allow.size() && allow[j] != L',' && allow[j] != L'，' &&
+               allow[j] != L';' && allow[j] != L'；' && allow[j] != L' ') j++;
+        if (j > i && wcsncmp(ip, allow.c_str() + i, j - i) == 0) return true;
+        i = j + 1;
+    }
+    return false;
+}
+
+static void SendHttp(SOCKET c, int code, const char* status, const std::string& body) {
+    char hdr[160];
+    int n = snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\n"
+                     "Content-Length: %d\r\nConnection: close\r\n\r\n",
+                     code, status, (int)body.size());
+    if (n > 0) send(c, hdr, n, 0);
+    if (!body.empty()) send(c, body.data(), (int)body.size(), 0);
+}
+
+// 单线程顺序处理：收完请求头 → 按 Content-Length 收 body → 解析 → 统一应答。
+// 刻意简化：同一时刻只服务一个连接，收发各挂 3s 超时防半开连接卡死
+static void HandleClient(SOCKET c, DWORD peer, const std::wstring& allow) {
+    DWORD tmo = 3000;
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, (char*)&tmo, sizeof tmo);
+    setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, (char*)&tmo, sizeof tmo);
+
+    char ip[64] = "";
+    inet_ntop(AF_INET, &peer, ip, sizeof ip);
+    wchar_t wip[64] = L"";
+    MultiByteToWideChar(CP_UTF8, 0, ip, -1, wip, 64);
+
+    std::string req, body;
+    if (IpAllowed(wip, allow)) {
+        size_t hdrEnd = std::string::npos;
+        char buf[4096];
+        while (req.size() < 8192) {
+            int r = recv(c, buf, sizeof buf, 0);
+            if (r <= 0) break;
+            req.append(buf, r);
+            hdrEnd = req.find("\r\n\r\n");
+            if (hdrEnd != std::string::npos) break;
+        }
+        if (hdrEnd != std::string::npos) {
+            std::string low = req.substr(0, hdrEnd);
+            for (char& ch : low) ch = (char)tolower((unsigned char)ch);
+            int cl = 0;
+            size_t p = low.find("content-length:");
+            if (p != std::string::npos) cl = atoi(low.c_str() + p + 15);
+            if (cl < 0 || cl > 65536) cl = 65536;
+            size_t have = req.size() - hdrEnd - 4;
+            while (have < (size_t)cl) {
+                int r = recv(c, buf, sizeof buf, 0);
+                if (r <= 0) break;
+                req.append(buf, r);
+                have += r;
+            }
+            body = req.substr(hdrEnd + 4, (size_t)cl);
+        }
+    }
+
+    std::wstring msg;
+    bool good = false;
+    if (!body.empty()) {
+        int wl = MultiByteToWideChar(CP_UTF8, 0, body.data(), (int)body.size(), nullptr, 0);
+        if (wl > 0 && wl < 65536) {
+            std::wstring w(wl, 0);
+            MultiByteToWideChar(CP_UTF8, 0, body.data(), (int)body.size(), &w[0], wl);
+            good = ParseMsgJson(w, msg);
+        }
+    }
+    if (good) {
+        SendHttp(c, 200, "OK", "OK");
+        wchar_t* heap = new wchar_t[msg.size() + 1];
+        wmemcpy(heap, msg.c_str(), msg.size() + 1);
+        PostMessageW(g_hwnd, WM_MSG, 0, (LPARAM)heap);
+    } else {
+        SendHttp(c, 400, "Bad Request",
+                 WideToUtf8(L"请按照 {\"msg\":\"XXXXX\"}这个格式发送"));
+    }
+    closesocket(c);
+}
+
+static DWORD WINAPI ListenThread(LPVOID) {
+    std::wstring allow = g_listenAllow;                    // 启动时快照
+    while (g_listenOn) {
+        sockaddr_in ca{};
+        int cl = sizeof ca;
+        SOCKET c = accept(g_srvSock, (sockaddr*)&ca, &cl);
+        if (c == INVALID_SOCKET) break;                    // 停止 = closesocket 唤醒
+        HandleClient(c, ca.sin_addr.S_un.S_addr, allow);
+    }
+    return 0;
+}
+
+static void SaveListenCfg() {
+    WritePrivateProfileStringW(L"listen", L"port", std::to_wstring(g_listenPort).c_str(),
+                               g_iniConf.c_str());
+    WritePrivateProfileStringW(L"listen", L"allow", g_listenAllow.c_str(), g_iniConf.c_str());
+}
+
+static bool StartListener() {
+    if (g_listenOn) return true;
+    if (!g_wsaOk) {
+        WSADATA d;
+        if (WSAStartup(MAKEWORD(2, 2), &d) != 0) {
+            g_listenStatus = L"网络初始化失败";
+            return false;
+        }
+        g_wsaOk = true;
+    }
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) { g_listenStatus = L"创建套接字失败"; return false; }
+    BOOL reuse = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof reuse);
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons((u_short)g_listenPort);
+    a.sin_addr.s_addr = INADDR_ANY;
+    if (bind(s, (sockaddr*)&a, sizeof a) != 0) {
+        closesocket(s);
+        g_listenStatus = g_listenPort ? L"启动失败：端口被占用" : L"启动失败";
+        return false;
+    }
+    listen(s, 8);
+    sockaddr_in got{}; int gl = sizeof got;
+    g_listenActual = (getsockname(s, (sockaddr*)&got, &gl) == 0) ? ntohs(got.sin_port) : 0;
+    g_srvSock = s;
+    g_listenOn = true;
+    g_listenThread = CreateThread(nullptr, 0, ListenThread, nullptr, 0, nullptr);
+    wchar_t b[64];
+    wsprintfW(b, L"监听中 · 端口 %d", g_listenActual);
+    g_listenStatus = b;
+    InvalidateRect(g_hwnd, nullptr, FALSE);                // 播放按钮点亮
+    return true;
+}
+
+static void StopListener() {
+    if (!g_listenOn) return;
+    g_listenOn = false;
+    closesocket(g_srvSock);                                // 唤醒阻塞在 accept 的线程
+    g_srvSock = INVALID_SOCKET;
+    if (g_listenThread) {
+        WaitForSingleObject(g_listenThread, 500);          // 正在收发的场景有 3s 超时，届时自行退出
+        CloseHandle(g_listenThread);
+        g_listenThread = nullptr;
+    }
+    g_listenStatus = L"已停止";
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// ---------------- 消息弹框（主显示器正中 · 最上层 · 不抢焦点） ----------------
+static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_brCard);
+        gp::Graphics g(dc); GdipSetup(g);
+        GdipStrokeRound(g, rc, S(12), C_SPLIT, 160, 1.0f);
+        std::wstring txt = g_msgText.empty() ? L"(空消息)" : g_msgText;
+        auto lines = WrapText(dc, txt, rc.right - S(36), 3);
+        int tot = (int)lines.size() * TextLineH();
+        int y = rc.top + (rc.bottom - rc.top - tot) / 2;
+        for (size_t i = 0; i < lines.size(); i++) {
+            RECT lr{ S(18), y + (int)i * TextLineH(), rc.right - S(18), y + (int)(i + 1) * TextLineH() };
+            DrawTextRect(dc, lr, lines[i].c_str(), g_fUi, C_TEXT,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_TIMER:
+        if (w == 1) { KillTimer(h, 1); FadeOut(h, 150); }
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void ShowToast(const std::wstring& text) {
+    int w = S(240), h = S(120);
+    if (!g_hToast) {
+        WNDCLASSW tc = {};
+        tc.lpfnWndProc = ToastProc;
+        tc.hInstance = g_hInst;
+        tc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        tc.hbrBackground = nullptr;                        // 同其他弹窗：防系统底色闪一帧
+        tc.lpszClassName = TOAST_CLASS;
+        RegisterClassW(&tc);
+        g_hToast = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, TOAST_CLASS, L"",
+                                   WS_POPUP, 0, 0, w, h, nullptr, nullptr, g_hInst, nullptr);
+        if (!g_hToast) return;
+        EnableRoundedCorner(g_hToast, C_EDGE);
+        ApplyRoundRegion(g_hToast, true);
+    }
+    g_msgText = text;
+    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;       // 主显示器正中
+    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
+    SetWindowPos(g_hToast, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    FadeIn(g_hToast, 120, SW_SHOWNOACTIVATE);
+    InvalidateRect(g_hToast, nullptr, FALSE);
+    SetTimer(g_hToast, 1, 3500, nullptr);
+}
+
+// ---------------- 监听设置对话框 ----------------
+static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_CREATE: {
+        g_dlgBtns.clear(); g_dlgEdits.clear();
+        HINSTANCE inst = ((CREATESTRUCTW*)l)->hInstance;
+        int x = S(16), lw = S(84), fw = S(380) - x * 2 - lw;
+        auto label = [&](const wchar_t* t, int px, int py) {
+            CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
+                            px, py, lw, S(18), h, nullptr, inst, nullptr);
+        };
+        auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id) -> HWND {
+            g_dlgEdits.push_back({ px, py, px + pw, py + S(28) });
+            HWND c = CreateWindowExW(0, L"EDIT", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
+                                     px + S(2), py + S(2), pw - S(4), S(28) - S(4),
+                                     h, (HMENU)(INT_PTR)id, inst, nullptr);
+            SendMessageW(c, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(8), S(8)));
+            return c;
+        };
+        wchar_t pb[16] = L"";
+        if (g_listenPort) wsprintfW(pb, L"%d", g_listenPort);
+        label(L"端口", x, S(46) + S(5));
+        g_hPort = edit(x + lw, S(46), S(140), pb, IDC_PORT);
+        label(L"允许IP前缀", x, S(88) + S(5));
+        g_hAllow = edit(x + lw, S(88), fw, g_listenAllow.c_str(), IDC_ALLOW);
+        g_dlgBtns.push_back({ { S(380) - x - S(88), S(158), S(380) - x, S(158) + S(28) },
+                              IDOK, g_listenOn ? L"停止监听" : L"启动监听", true });
+        g_rcDlgX = { S(380) - S(40), 0, S(380) - S(8), S(36) };
+        return 0;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        DrawDlgFace(h, dc);
+        DrawTextRect(dc, { S(16), S(126), S(380) - S(16), S(148) },
+                     g_listenStatus.c_str(), g_fSmall, C_MUT,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_NCACTIVATE:
+        return DefWindowProcW(h, m, w, -1);
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_CTLCOLOREDIT: {
+        HDC dc = (HDC)w;
+        SetBkColor(dc, C_INSET); SetTextColor(dc, C_TEXT);
+        SelectObject(dc, g_fUi);
+        return (LRESULT)g_brInset;     // 必须实心刷：HOLLOW 刷走 PatBlt 会整块变黑
+    }
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)w;
+        SetBkColor(dc, C_CARD); SetTextColor(dc, C_TEXT);
+        SelectObject(dc, g_fUi);
+        return (LRESULT)g_brCard;
+    }
+    case WM_LBUTTONDOWN: {
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        if (PtInRect(&g_rcDlgX, pt)) { DestroyWindow(h); return 0; }
+        if (FindDlgBtn(pt)) { SendMessageW(h, WM_COMMAND, IDOK, 0); return 0; }
+        if (pt.y < S(36)) {
+            ReleaseCapture();
+            SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        }
+        return 0;
+    }
+    case WM_SETCURSOR: {
+        if (LOWORD(l) == HTCLIENT) {
+            POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
+            bool hand = PtInRect(&g_rcDlgX, pt) || FindDlgBtn(pt);
+            SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
+    }
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) { DestroyWindow(h); return 0; }
+        break;
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK) {
+            if (g_listenOn) {
+                StopListener();
+                DestroyWindow(h);
+                return 0;
+            }
+            wchar_t b[512];
+            GetWindowTextW(g_hPort, b, 64);
+            int p = _wtoi(b);
+            if (p < 0 || p > 65535) {
+                g_listenStatus = L"端口无效：留空 = 随机，或填 1-65535";
+                InvalidateRect(h, nullptr, TRUE);
+                return 0;
+            }
+            GetWindowTextW(g_hAllow, b, 512);
+            g_listenAllow = b;
+            g_listenPort = p;
+            SaveListenCfg();
+            if (StartListener()) DestroyWindow(h);         // 启动成功即收起
+            else InvalidateRect(h, nullptr, TRUE);         // 失败：状态行给出原因
+            return 0;
+        }
+        break;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_NCDESTROY:
+        g_hLstn = nullptr; g_hPort = g_hAllow = nullptr;
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void OpenListenDlg() {
+    if (g_hLstn) { SetForegroundWindow(g_hLstn); return; }
+    if (g_hDlg) DestroyWindow(g_hDlg);                     // 按钮数组全局共享，禁止对话框并发
+    if (g_hHK) DestroyWindow(g_hHK);
+    if (!g_listenOn) g_listenStatus = L"端口留空 = 随机端口；前缀留空 = 允许所有来源";
+    int cw = S(380), ch = S(202);
+    RECT mr{};
+    if (g_hwnd) GetWindowRect(g_hwnd, &mr);
+    g_hLstn = CreateWindowExW(0, LSTN_CLASS, L"消息监听", WS_POPUP,
+                              mr.left + ((mr.right - mr.left) - cw) / 2,
+                              mr.top + ((mr.bottom - mr.top) - ch) / 2,
+                              cw, ch, g_hwnd, nullptr, g_hInst, nullptr);
+    if (g_hLstn) {
+        EnableRoundedCorner(g_hLstn, C_EDGE);
+        ApplyRoundRegion(g_hLstn, true);
+        FadeIn(g_hLstn, 120);
     }
 }
 
@@ -1564,7 +1983,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         Hit hh = HitTest(pt);
         if (PtInRect(&g_rcTitle, pt) &&
-            !(hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN))
+            !(hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PLAY))
             return HTCAPTION;
         return HTCLIENT;
     }
@@ -1614,7 +2033,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
             Hit hh = HitTest(pt);
             bool hand = hh.reg == R_CELL || hh.reg == R_TAG || hh.reg == R_ADDTAG ||
-                        (hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PIN);
+                        (hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PLAY);
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
@@ -1637,6 +2056,9 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case R_BTN_PIN:
             g_pinned = !g_pinned; ApplyPin(); SaveWinPos();
             InvalidateRect(h, nullptr, FALSE);
+            break;
+        case R_BTN_PLAY:
+            OpenListenDlg();
             break;
         case R_ADDTAG:
             OpenEditor(NT_TAG, 0, nullptr);
@@ -1714,6 +2136,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_MSG: {
+        wchar_t* p = (wchar_t*)l;
+        if (p) { ShowToast(p); delete[] p; }
+        return 0;
+    }
     case WM_DPICHANGED: {
         g_dpi = HIWORD(w);
         MakeFonts();
@@ -1780,6 +2207,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_sortMode         = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"sort", 0, g_iniConf.c_str())));
     ApplyTheme((int)GetPrivateProfileIntW(L"ui", L"theme", 0, g_iniConf.c_str()));   // 深色为默认
     g_startHidden      = GetPrivateProfileIntW(L"behavior", L"startHidden", 0, g_iniConf.c_str()) != 0;
+    g_listenPort       = GetPrivateProfileIntW(L"listen", L"port", 0, g_iniConf.c_str());
+    if (g_listenPort < 0 || g_listenPort > 65535) g_listenPort = 0;
+    {
+        wchar_t ab[512];
+        GetPrivateProfileStringW(L"listen", L"allow", L"", ab, 512, g_iniConf.c_str());
+        g_listenAllow = ab;
+    }
     int wx = GetPrivateProfileIntW(L"ui", L"x", -32000, g_iniConf.c_str());
     int wy = GetPrivateProfileIntW(L"ui", L"y", -32000, g_iniConf.c_str());
     int ww = std::max(S(430), (int)GetPrivateProfileIntW(L"ui", L"w", S(660), g_iniConf.c_str()));
@@ -1819,6 +2253,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     hk.hbrBackground = nullptr;
     hk.lpszClassName = HK_CLASS;
     RegisterClassW(&hk);
+
+    WNDCLASSW ls = {};                                    // 监听设置窗口类
+    ls.lpfnWndProc = LstnProc;
+    ls.hInstance = hInst;
+    ls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    ls.hbrBackground = nullptr;
+    ls.lpszClassName = LSTN_CLASS;
+    RegisterClassW(&ls);
 
     WNDCLASSW mc = {};                                    // 自绘菜单窗口类
     mc.lpfnWndProc = MenuProc;

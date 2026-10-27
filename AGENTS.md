@@ -97,7 +97,7 @@
 x86_64-w64-mingw32-windres --codepage 65001 -I src src/res.rc -O coff -o build/res.o
 x86_64-w64-mingw32-g++ -std=c++17 -O1 -municode -mwindows -DUNICODE -D_UNICODE \
   -D_WIN32_WINNT=0x0A00 src/main.cpp build/res.o -o dist/Launcher-preview.exe \
-  -luser32 -lgdi32 -lgdiplus -lshell32 -lcomdlg32 -ldwmapi -static -s
+  -luser32 -lgdi32 -lgdiplus -lshell32 -lcomdlg32 -ldwmapi -lws2_32 -static -s
 ```
 
 - MinGW 与 MSVC 差异是坑源：MSVC 默认非 UTF-8（`cl` 须 `/utf-8`、`rc` 须 `/c 65001`，否则中文字面量编译期变乱码）；`windows.h` 的 min/max 宏会打碎 `std::max`（须 `NOMINMAX`）。MinGW 预览通过 ≠ MSVC 通过，两边语法都要过
@@ -114,7 +114,8 @@ x86_64-w64-mingw32-g++ -std=c++17 -O1 -municode -mwindows -DUNICODE -D_UNICODE \
 
 - 无边框窗口四件套：样式无 `WS_CAPTION`（只留 `WS_THICKFRAME|WS_SYSMENU|MIN|MAX`）、`WM_NCCALCSIZE` 返回 0（最大化时客户区内缩一圈边框）、`WM_NCHITTEST` 自定义边缘、创建后 `SWP_FRAMECHANGED` 强制首帧重排——缺一会出现系统标题栏残留或内容溢出
 - Win11 观感走 DWM 属性（动态加载 dwmapi）：圆角 `DWMWCP_ROUND`、描边 `C_EDGE`、标题栏染天蓝兜底；Win10 自动跳过
-- 编辑/热键对话框自绘：`WS_POPUP` + `g_dlgBtns`/`g_dlgEdits` + `DrawDlgBtns`/`FindDlgBtn`，弹出居中主窗口，两对话框互斥（共享按钮数组）
+- 编辑/热键/监听三对话框自绘：`WS_POPUP` + `g_dlgBtns`/`g_dlgEdits` + `DrawDlgBtns`/`FindDlgBtn`，弹出居中主窗口，三对话框互斥（共享按钮数组）
+- 消息监听：标题栏第 4 枚按钮（播放，`g_rcBtns[3]`）打开监听设置对话框；Winsock2 单线程 accept（停止 = closesocket 唤醒，收发 3s 超时），配置存 conf.ini `[listen]`（port 0=随机，allow=来源 IP 字面前缀白名单，逗号分隔，空=全放行）；body 解析 `{"msg":"..."}`（宽松取值+转义）成功回 200 并 `PostMessage(WM_MSG)` → `ShowToast` 主显示器正中 TOPMOST 不抢焦点 3.5s 自动淡出，其余一律 400 + 格式提示；winsock2.h 必须在 windows.h 之前包含，链接加 ws2_32
 - 主窗口绘制在 `PaintAll`，布局在 `LayoutNow`（`g_rcTabs` 布局区），命中在 `HitTest`；`S()` 按 DPI 缩放所有尺寸
 
 ### 协作习惯（用户本人）
