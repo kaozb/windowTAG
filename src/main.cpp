@@ -59,7 +59,7 @@ enum {
 };
 
 // 编辑框控件 ID
-enum { IDC_NAME = 1001, IDC_PATH, IDC_PARAMS, IDC_BROWSE, IDC_PORT, IDC_ALLOW };
+enum { IDC_NAME = 1001, IDC_PATH, IDC_PARAMS, IDC_BROWSE, IDC_PORT, IDC_ALLOW, IDC_TSEC };
 
 // ---------------- 全局状态 ----------------
 static const wchar_t MAIN_CLASS[] = L"LNP_MainWnd";
@@ -101,11 +101,12 @@ static HWND g_hHK = nullptr;         // 热键对话框（编辑对话框句柄�
 // 消息监听（HTTP）与屏幕弹框
 static const wchar_t LSTN_CLASS[]  = L"LNP_ListenWnd";
 static const wchar_t TOAST_CLASS[] = L"LNP_MsgWnd";
-static HWND g_hLstn = nullptr, g_hPort = nullptr, g_hAllow = nullptr, g_hToast = nullptr;
-static int  g_listenPort = 0;            // 配置端口，0 = 随机
+static HWND g_hLstn = nullptr, g_hPort = nullptr, g_hAllow = nullptr, g_hTSec = nullptr, g_hToast = nullptr;
+static int  g_listenPort = 22222;        // 配置端口，0 = 随机
+static int  g_listenActual = 0;          // 实际绑定端口
+static int  g_toastSec = 5;              // 弹框停留秒数，0 = 不自动消失
 static std::wstring g_listenAllow;       // 允许来源 IP 前缀（逗号分隔，空 = 不限）
 static std::atomic<bool> g_listenOn{ false };
-static int  g_listenActual = 0;          // 实际绑定端口
 static std::wstring g_listenStatus;      // 监听对话框状态行
 static SOCKET g_srvSock = INVALID_SOCKET;
 static HANDLE g_listenThread = nullptr;
@@ -1708,6 +1709,8 @@ static void SaveListenCfg() {
     WritePrivateProfileStringW(L"listen", L"port", std::to_wstring(g_listenPort).c_str(),
                                g_iniConf.c_str());
     WritePrivateProfileStringW(L"listen", L"allow", g_listenAllow.c_str(), g_iniConf.c_str());
+    WritePrivateProfileStringW(L"listen", L"toast", std::to_wstring(g_toastSec).c_str(),
+                               g_iniConf.c_str());
 }
 
 // 托盘气泡提示（随机端口、启动失败等关键反馈；副本方式不污染 g_nid）
@@ -1849,7 +1852,8 @@ static void ShowToast(const std::wstring& text) {
     SetWindowPos(g_hToast, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
     FadeIn(g_hToast, 120, SW_SHOWNOACTIVATE);
     InvalidateRect(g_hToast, nullptr, FALSE);
-    SetTimer(g_hToast, 1, 5000, nullptr);
+    if (g_toastSec > 0) SetTimer(g_hToast, 1, g_toastSec * 1000, nullptr);   // 新消息重置计时
+    else KillTimer(g_hToast, 1);                           // 0 = 不自动消失，点击才关
 }
 
 // ---------------- 监听设置对话框 ----------------
@@ -1859,9 +1863,9 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_dlgBtns.clear(); g_dlgEdits.clear();
         HINSTANCE inst = ((CREATESTRUCTW*)l)->hInstance;
         int x = S(16), lw = S(84), fw = S(380) - x * 2 - lw;
-        auto label = [&](const wchar_t* t, int px, int py) {
+        auto label = [&](const wchar_t* t, int px, int py, int pw) {
             CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
-                            px, py, lw, S(18), h, nullptr, inst, nullptr);
+                            px, py, pw, S(18), h, nullptr, inst, nullptr);
         };
         auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id) -> HWND {
             g_dlgEdits.push_back({ px, py, px + pw, py + S(28) });
@@ -1873,13 +1877,17 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         };
         wchar_t pb[16] = L"";
         if (g_listenPort) wsprintfW(pb, L"%d", g_listenPort);
-        label(L"端口", x, S(46) + S(5));
+        label(L"端口", x, S(46) + S(5), lw);
         g_hPort = edit(x + lw, S(46), S(140), pb, IDC_PORT);
-        label(L"允许IP前缀", x, S(88) + S(5));
+        label(L"允许IP前缀", x, S(88) + S(5), lw);
         g_hAllow = edit(x + lw, S(88), fw, g_listenAllow.c_str(), IDC_ALLOW);
-        g_dlgBtns.push_back({ { S(380) - x - S(88) * 2 - S(8), S(158), S(380) - x - S(88) - S(8), S(158) + S(28) },
+        wchar_t tb[16] = L"";
+        wsprintfW(tb, L"%d", g_toastSec);
+        label(L"弹窗停留(秒)", x, S(130) + S(5), S(96));
+        g_hTSec = edit(x + S(96), S(130), S(140), tb, IDC_TSEC);
+        g_dlgBtns.push_back({ { S(380) - x - S(88) * 2 - S(8), S(204), S(380) - x - S(88) - S(8), S(204) + S(28) },
                               IDOK, L"确定", true });
-        g_dlgBtns.push_back({ { S(380) - x - S(88), S(158), S(380) - x, S(158) + S(28) },
+        g_dlgBtns.push_back({ { S(380) - x - S(88), S(204), S(380) - x, S(204) + S(28) },
                               IDCANCEL, L"取消", false });
         g_rcDlgX = { S(380) - S(40), 0, S(380) - S(8), S(36) };
         return 0;
@@ -1887,7 +1895,7 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         DrawDlgFace(h, dc);
-        DrawTextRect(dc, { S(16), S(126), S(380) - S(16), S(148) },
+        DrawTextRect(dc, { S(16), S(172), S(380) - S(16), S(194) },
                      g_listenStatus.c_str(), g_fSmall, C_MUT,
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         EndPaint(h, &ps);
@@ -1944,6 +1952,11 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             GetWindowTextW(g_hAllow, b, 512);
             g_listenAllow = b;
             g_listenPort = p;
+            GetWindowTextW(g_hTSec, b, 16);
+            int t = _wtoi(b);
+            if (t < 0) t = 0;
+            if (t > 86400) t = 86400;                      // 上限一天
+            g_toastSec = t;
             SaveListenCfg();
             if (g_listenOn) {                              // 改配置立即生效：按新配置重启
                 StopListener();
@@ -1956,7 +1969,7 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_CLOSE: DestroyWindow(h); return 0;
     case WM_NCDESTROY:
-        g_hLstn = nullptr; g_hPort = g_hAllow = nullptr;
+        g_hLstn = nullptr; g_hPort = g_hAllow = g_hTSec = nullptr;
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
@@ -1971,9 +1984,9 @@ static void OpenListenDlg() {
         wsprintfW(b, L"监听中 · 端口 %d · 修改后点确定将重启监听", g_listenActual);
         g_listenStatus = b;
     } else {
-        g_listenStatus = L"未监听 · 端口留空 = 随机端口；前缀留空 = 允许所有来源";
+        g_listenStatus = L"未监听 · 端口留空 = 随机 · 秒数 0 = 不自动消失";
     }
-    int cw = S(380), ch = S(202);
+    int cw = S(380), ch = S(250);
     RECT mr{};
     if (g_hwnd) GetWindowRect(g_hwnd, &mr);
     g_hLstn = CreateWindowExW(0, LSTN_CLASS, L"监听设置", WS_POPUP,
@@ -2011,11 +2024,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CLOSE: HideWin(); return 0;
+    case WM_NCLBUTTONDBLCLK:
+        if (w == HTCAPTION) return 0;     // 双击标题栏不最大化
+        break;
     case WM_NCCALCSIZE: {
         if (!w) break;
-        if (IsZoomed(h)) {                // 最大化：窗口比屏幕大一圈边框，客户区内缩，避免内容溢出
-            RECT br{ 0, 0, 0, 0 };
-            AdjustWindowRect(&br, WS_THICKFRAME | WS_CAPTION, FALSE);
+        if (IsZoomed(h)) {                // 最大化：窗口扩出屏幕一圈边框，只内缩边框量；
+            RECT br{ 0, 0, 0, 0 };        // 不含 CAPTION，否则顶部留出一条系统标题栏空位
+            AdjustWindowRect(&br, WS_THICKFRAME, FALSE);
             RECT* rcp = (RECT*)l;
             rcp->left -= br.left; rcp->top -= br.top;
             rcp->right -= br.right; rcp->bottom -= br.bottom;
@@ -2264,8 +2280,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_sortMode         = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"sort", 0, g_iniConf.c_str())));
     ApplyTheme((int)GetPrivateProfileIntW(L"ui", L"theme", 0, g_iniConf.c_str()));   // 深色为默认
     g_startHidden      = GetPrivateProfileIntW(L"behavior", L"startHidden", 0, g_iniConf.c_str()) != 0;
-    g_listenPort       = GetPrivateProfileIntW(L"listen", L"port", 0, g_iniConf.c_str());
-    if (g_listenPort < 0 || g_listenPort > 65535) g_listenPort = 0;
+    g_listenPort       = GetPrivateProfileIntW(L"listen", L"port", 22222, g_iniConf.c_str());
+    if (g_listenPort < 0 || g_listenPort > 65535) g_listenPort = 22222;
+    g_toastSec         = GetPrivateProfileIntW(L"listen", L"toast", 5, g_iniConf.c_str());
+    if (g_toastSec < 0 || g_toastSec > 86400) g_toastSec = 5;
     {
         wchar_t ab[512];
         GetPrivateProfileStringW(L"listen", L"allow", L"", ab, 512, g_iniConf.c_str());
