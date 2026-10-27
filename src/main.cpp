@@ -1500,6 +1500,12 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SetFocus(h);
         return 0;
     }
+    case WM_PAINT: {                                      // 画对话框脸面（标题/X/按钮），缺了只剩 STATIC 文字悬空
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        DrawDlgFace(h, dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
     case WM_NCACTIVATE:
         return DefWindowProcW(h, m, w, -1);
     case WM_ERASEBKGND:                                   // 同编辑弹窗：避免系统底色闪一帧
