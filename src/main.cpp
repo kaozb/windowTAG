@@ -24,6 +24,7 @@
 #include <vector>
 #include <map>
 #include <algorithm>
+#include <cmath>
 #include <cwctype>
 #include "version.h"
 
@@ -97,7 +98,7 @@ static ULONG_PTR g_gdipToken;
 
 // 配色：同一组语义槽位，两套值。0=深色（默认，取自用户提供的 Global 配色表）1=浅色
 static COLORREF C_BG, C_WHITE, C_BAR, C_CARD, C_HOVER, C_INSET, C_SHAD,
-                C_TEXT, C_MUT, C_ACC, C_ONTXT, C_SPLIT, C_EDGE;
+                C_TEXT, C_MUT, C_ACC, C_ONTXT, C_SPLIT, C_EDGE, C_MENU, C_MENUH;
 static int g_theme = 0;
 
 static void ApplyTheme(int idx) {
@@ -107,11 +108,13 @@ static void ApplyTheme(int idx) {
         C_HOVER = RGB(69, 69, 69); C_INSET = RGB(43, 43, 43); C_SHAD = RGB(0, 0, 0);
         C_TEXT  = RGB(255, 255, 255); C_MUT = RGB(146, 146, 146);
         C_SPLIT = RGB(107, 107, 107); C_EDGE = RGB(36, 36, 36);
+        C_MENU  = RGB(74, 74, 74);     C_MENUH = RGB(97, 97, 97);
     } else {
         C_BG    = RGB(237, 237, 237); C_BAR = RGB(248, 248, 248); C_CARD = RGB(255, 255, 255);
         C_HOVER = RGB(238, 244, 250); C_INSET = RGB(243, 243, 243); C_SHAD = RGB(70, 70, 70);
         C_TEXT  = RGB(34, 34, 34); C_MUT = RGB(124, 124, 124);
         C_SPLIT = RGB(212, 212, 212); C_EDGE = RGB(198, 198, 198);
+        C_MENU  = RGB(255, 255, 255);  C_MENUH = RGB(238, 244, 250);
     }
     C_WHITE = RGB(255, 255, 255);
     C_ACC   = RGB(120, 150, 180);                       // 主色两套主题共用
@@ -731,52 +734,319 @@ static void OpenEditor(int type, int parent, const Node* src) {
     }
 }
 
-// ---------------- 菜单 ----------------
-static int PopupMenuScreen(HMENU m, POINT scr) {
-    SetForegroundWindow(g_hwnd);
-    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, scr.x, scr.y, 0, g_hwnd, nullptr);
-    PostMessageW(g_hwnd, WM_NULL, 0, 0);
-    DestroyMenu(m);
-    return cmd;
+// ---------------- 自绘弹出菜单 ----------------
+// 系统菜单在深色主题下是白底灰框，和主体完全不搭。这里自绘：圆角、软阴影、同款字体与配色。
+// 用 WS_EX_LAYERED + UpdateLayeredWindow 做逐像素 alpha，圆角才是抗锯齿的（SetWindowRgn 会留锯齿边）。
+struct MItem {
+    int id = 0;
+    std::wstring text;
+    bool sep = false;
+    bool check = false;
+    std::vector<MItem> sub;
+};
+static void MAdd(std::vector<MItem>& v, int id, const wchar_t* t, bool ck = false) {
+    MItem it; it.id = id; it.text = t; it.check = ck; v.push_back(it);
+}
+static void MSep(std::vector<MItem>& v) { MItem it; it.sep = true; v.push_back(it); }
+static void MSub(std::vector<MItem>& v, const wchar_t* t, std::vector<MItem> s) {
+    MItem it; it.text = t; it.sub = std::move(s); v.push_back(it);
 }
 
-static int PopupMenuClient(HMENU m, POINT ptClient) {
-    POINT s = ptClient;
-    ClientToScreen(g_hwnd, &s);
-    return PopupMenuScreen(m, s);
+static int MenuM()     { return S(10); }      // 四周阴影留白
+static int MenuRad()   { return S(10); }
+static int MenuItemH() { return S(30); }
+static int MenuSepH()  { return S(9); }
+static int MenuPad()   { return S(5); }
+
+struct MPanel {
+    std::vector<MItem> items;
+    std::vector<RECT>  rc;                    // 条目矩形（客户区坐标，已含阴影留白）
+    int pw = 0, ph = 0, sw = 0, sh = 0;
+    int hover = -1;
+    HWND hwnd = nullptr;
+    HWND owner = nullptr;
+    MPanel* child = nullptr;
+    POINT pos{};
+    HDC dc = nullptr; HBITMAP bmp = nullptr, oldBmp = nullptr; void* bits = nullptr;
+};
+static std::vector<MPanel*> g_panels;
+static bool g_menuDone = true, g_menuClosing = false, g_lbtnDown = true;
+static int  g_menuPick = 0;
+static const wchar_t MENU_CLASS[] = L"LNP_MenuWnd";
+static void MenuCloseAll();
+static void MenuCloseSub(MPanel*);
+static void MenuOpenSub(MPanel*, int);
+
+static void MenuLayout(MPanel* p) {
+    int m = MenuM();
+    HDC dc = GetDC(g_hwnd);
+    HFONT of = (HFONT)SelectObject(dc, g_fUi);
+    int maxw = S(60);
+    for (auto& it : p->items) {
+        if (it.sep) continue;
+        SIZE sz{}; GetTextExtentPoint32W(dc, it.text.c_str(), (int)it.text.size(), &sz);
+        if (sz.cx > maxw) maxw = sz.cx;
+    }
+    SelectObject(dc, of); ReleaseDC(g_hwnd, dc);
+    p->pw = MenuPad() * 2 + S(20) + maxw + S(18);       // 勾选列 + 文字 + 箭头列
+    int y = MenuPad();
+    p->rc.clear();
+    for (auto& it : p->items) {
+        int ih = it.sep ? MenuSepH() : MenuItemH();
+        p->rc.push_back({ m + MenuPad(), m + y, m + p->pw - MenuPad(), m + y + ih });
+        y += ih;
+    }
+    p->ph = y + MenuPad();
+    p->sw = p->pw + m * 2;
+    p->sh = p->ph + m * 2;
+}
+
+// 圆角矩形有符号距离场：内部为负，外部为正；用于抗锯齿边缘与软阴影衰减
+static float MenuSdf(float x, float y, float cx, float cy, float hw, float hh, float r) {
+    float qx = fabsf(x - cx) - hw + r, qy = fabsf(y - cy) - hh + r;
+    float ax = qx > 0 ? qx : 0, ay = qy > 0 ? qy : 0;
+    float mx = qx > qy ? qx : qy;
+    return sqrtf(ax * ax + ay * ay) + (mx < 0 ? mx : 0) - r;
+}
+
+static void MenuAlpha(MPanel* p) {
+    int m = MenuM();
+    float cx = (float)m + p->pw * 0.5f, cy = (float)m + p->ph * 0.5f;
+    float hw = p->pw * 0.5f, hh = p->ph * 0.5f, rad = (float)MenuRad(), mm = (float)m;
+    BYTE* px = (BYTE*)p->bits;
+    for (int y = 0; y < p->sh; y++) {
+        for (int x = 0; x < p->sw; x++) {
+            BYTE* q = px + ((size_t)y * p->sw + x) * 4;
+            float d = MenuSdf((float)x + 0.5f, (float)y + 0.5f, cx, cy, hw, hh, rad);
+            float a;
+            if (d <= -0.5f) a = 255.0f;
+            else if (d < 0.5f) a = (0.5f - d) * 255.0f;          // 边缘抗锯齿
+            else {
+                float t = (d - 0.5f) / mm;
+                a = t >= 1.0f ? 0.0f : (1.0f - t) * (1.0f - t) * 100.0f;   // 软阴影
+            }
+            float f = a / 255.0f;                                // AC_SRC_ALPHA 要求预乘
+            q[0] = (BYTE)(q[0] * f); q[1] = (BYTE)(q[1] * f); q[2] = (BYTE)(q[2] * f);
+            q[3] = (BYTE)a;
+        }
+    }
+}
+
+static void MenuRender(MPanel* p) {
+    if (!p->dc) {
+        BITMAPINFO bi{};
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = p->sw;
+        bi.bmiHeader.biHeight = -p->sh;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        p->dc = CreateCompatibleDC(nullptr);
+        p->bmp = CreateDIBSection(p->dc, &bi, DIB_RGB_COLORS, &p->bits, nullptr, 0);
+        p->oldBmp = (HBITMAP)SelectObject(p->dc, p->bmp);
+    }
+    memset(p->bits, 0, (size_t)p->sw * p->sh * 4);           // 透明黑：面板外即纯黑阴影
+    int m = MenuM();
+    RECT pr{ m, m, m + p->pw, m + p->ph };
+    gp::Graphics g(p->dc); GdipSetup(g);
+    GdipFillRound(g, pr, (FLOAT)MenuRad(), C_MENU, 255);
+    for (size_t i = 0; i < p->items.size(); i++) {
+        const MItem& it = p->items[i];
+        RECT r = p->rc[i];
+        if (it.sep) {
+            int yy = (r.top + r.bottom) / 2;
+            RECT ln{ r.left + S(6), yy, r.right - S(6), yy + 1 };
+            GdipFillRound(g, ln, 0.5f, C_SPLIT, 255);
+            continue;
+        }
+        if ((int)i == p->hover) GdipFillRound(g, r, (FLOAT)S(6), C_MENUH, 255);
+        if (it.check) DrawGlyph(p->dc, { r.left + S(2), r.top, r.left + S(20), r.bottom }, 0xE73E, C_ACC);
+        RECT tr{ r.left + S(20), r.top, r.right - S(18), r.bottom };
+        DrawTextRect(p->dc, tr, it.text.c_str(), g_fUi, C_TEXT,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (!it.sub.empty())
+            DrawGlyph(p->dc, { r.right - S(18), r.top, r.right, r.bottom }, 0xE76C, C_MUT);
+    }
+    MenuAlpha(p);
+}
+
+static void MenuCommit(MPanel* p) {
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    SIZE sz{ p->sw, p->sh };
+    POINT src{ 0, 0 }, dst{ p->pos.x, p->pos.y };
+    UpdateLayeredWindow(p->hwnd, nullptr, &dst, &sz, p->dc, &src, 0, &bf, ULW_ALPHA);
+}
+
+static void MenuShow(MPanel* p, POINT at) {
+    p->pos = at;
+    g_panels.push_back(p);
+    p->hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MENU_CLASS, L"",
+                              WS_POPUP, at.x, at.y, p->sw, p->sh, p->owner, nullptr, g_hInst, p);
+    if (!p->hwnd) return;
+    MenuRender(p);
+    MenuCommit(p);
+    ShowWindow(p->hwnd, SW_SHOW);
+    SetForegroundWindow(p->hwnd);
+}
+
+static void MenuFree(MPanel* p) {
+    if (p->hwnd) DestroyWindow(p->hwnd);
+    if (p->bmp) { SelectObject(p->dc, p->oldBmp); DeleteObject(p->bmp); }
+    if (p->dc) DeleteDC(p->dc);
+    delete p;
+}
+
+static void MenuCloseSub(MPanel* p) {
+    if (!p->child) return;
+    for (size_t i = 0; i < g_panels.size(); i++)
+        if (g_panels[i] == p->child) { g_panels.erase(g_panels.begin() + i); break; }
+    MenuFree(p->child);
+    p->child = nullptr;
+}
+
+static void MenuCloseAll() {
+    if (g_menuClosing) return;
+    g_menuClosing = true;
+    auto all = g_panels;
+    g_panels.clear();
+    for (auto* p : all) MenuFree(p);
+    g_menuDone = true;
+    g_menuClosing = false;
+}
+
+static void MenuOpenSub(MPanel* p, int idx) {
+    if (p->child) return;
+    MPanel* c = new MPanel;
+    c->items = p->items[idx].sub;
+    c->owner = p->owner;
+    MenuLayout(c);
+    RECT pr; GetWindowRect(p->hwnd, &pr);
+    int x = pr.left + MenuM() + p->pw - S(6);
+    int y = pr.top + p->rc[idx].top - S(6);
+    MONITORINFO mi{}; mi.cbSize = sizeof mi;
+    GetMonitorInfoW(MonitorFromPoint({ x, y }, MONITOR_DEFAULTTONEAREST), &mi);
+    if (x + c->sw > mi.rcWork.right) x = pr.left - c->sw + MenuM() + S(6);   // 右边放不下就翻到左侧
+    if (y + c->sh > mi.rcWork.bottom) y = mi.rcWork.bottom - c->sh;
+    p->child = c;
+    MenuShow(c, { x, y });
+}
+
+static LRESULT CALLBACK MenuProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    MPanel* p = (MPanel*)GetWindowLongPtrW(h, GWLP_USERDATA);
+    switch (m) {
+    case WM_CREATE:
+        SetWindowLongPtrW(h, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW*)l)->lpCreateParams);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_MOUSEMOVE: {
+        if (!p) break;
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        int hit = -1;
+        for (size_t i = 0; i < p->rc.size(); i++)
+            if (!p->items[i].sep && PtInRect(&p->rc[i], pt)) { hit = (int)i; break; }
+        if (hit != p->hover) { p->hover = hit; MenuRender(p); MenuCommit(p); }
+        if (hit >= 0 && !p->items[hit].sub.empty()) MenuOpenSub(p, hit);
+        else if (hit >= 0 && p->child) MenuCloseSub(p);
+        return 0;
+    }
+    case WM_LBUTTONUP: {
+        if (!p) break;
+        POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+        bool hitItem = false;
+        for (size_t i = 0; i < p->rc.size(); i++) {
+            if (p->items[i].sep || !PtInRect(&p->rc[i], pt)) continue;
+            hitItem = true;
+            if (p->items[i].sub.empty()) { g_menuPick = p->items[i].id; MenuCloseAll(); }
+            break;
+        }
+        if (!hitItem) MenuCloseAll();       // 点在留白/阴影上：和系统菜单一样直接收起
+        return 0;
+    }
+    case WM_RBUTTONUP:
+        MenuCloseAll();
+        return 0;
+    case WM_TIMER: {
+        // 兜底：菜单未抢到激活时也能靠全局左键状态感知"外部点击"而收起
+        bool down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        if (down && !g_lbtnDown) {
+            POINT c; GetCursorPos(&c);
+            bool inside = false;
+            for (auto* q : g_panels) {
+                RECT wr; GetWindowRect(q->hwnd, &wr);
+                if (PtInRect(&wr, c)) inside = true;
+            }
+            if (!inside) { g_lbtnDown = down; MenuCloseAll(); return 0; }
+        }
+        g_lbtnDown = down;
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE) { MenuCloseAll(); return 0; }
+        break;
+    case WM_ACTIVATE: {
+        if (LOWORD(w) != WA_INACTIVE || g_menuClosing) break;
+        HWND a = GetActiveWindow();
+        bool ours = false;
+        for (auto* q : g_panels) if (q->hwnd == a) ours = true;
+        if (!ours) MenuCloseAll();                   // 点到别处：收起整套菜单
+        break;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+static int MPopup(std::vector<MItem> items, POINT scr, HWND owner = nullptr) {
+    g_menuPick = 0;
+    g_menuDone = false;
+    g_lbtnDown = true;                       // 打开菜单的左键可能正按着（按钮触发），不能算外部点击
+    MPanel* p = new MPanel;
+    p->items = std::move(items);
+    p->owner = owner ? owner : g_hwnd;       // 托盘场景主窗口是隐藏的，不能在隐藏 owner 下挂弹出菜单
+    MenuLayout(p);
+    MONITORINFO mi{}; mi.cbSize = sizeof mi;
+    GetMonitorInfoW(MonitorFromPoint(scr, MONITOR_DEFAULTTONEAREST), &mi);
+    int x = scr.x, y = scr.y;
+    if (x + p->sw > mi.rcWork.right)  x = mi.rcWork.right - p->sw;
+    if (y + p->sh > mi.rcWork.bottom) y = mi.rcWork.bottom - p->sh;
+    MenuShow(p, { x, y });
+    if (p->hwnd) SetTimer(p->hwnd, 1, 20, nullptr);
+    MSG msg;
+    while (!g_menuDone && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
+    if (!g_menuDone) PostQuitMessage((int)msg.wParam);
+    MenuCloseAll();
+    return g_menuPick;
 }
 
 static void ShowMainMenu() {
-    HMENU m = CreatePopupMenu();
-    HMENU mi = CreatePopupMenu();                       // 图标大小
-    for (int i = 0; i < 3; i++) {
-        static const wchar_t* kTxt[3] = { L"小", L"中", L"大" };
-        AppendMenuW(mi, MF_STRING | (g_iconIdx == i ? MF_CHECKED : 0), M_ICON0 + i, kTxt[i]);
-    }
-    HMENU ms = CreatePopupMenu();                        // 排序方式
-    for (int i = 0; i < 3; i++) {
-        static const wchar_t* kTxt[3] = { L"添加顺序", L"名称升序", L"名称降序" };
-        AppendMenuW(ms, MF_STRING | (g_sortMode == i ? MF_CHECKED : 0), M_SORT0 + i, kTxt[i]);
-    }
-    HMENU mt = CreatePopupMenu();                        // 主题
-    for (int i = 0; i < 2; i++) {
-        static const wchar_t* kTxt[2] = { L"深色", L"浅色" };
-        AppendMenuW(mt, MF_STRING | (g_theme == i ? MF_CHECKED : 0), M_THEME0 + i, kTxt[i]);
-    }
-    AppendMenuW(m, MF_STRING, M_ADDTAG, L"添加标签");
-    AppendMenuW(m, MF_STRING, M_ADDLINK, L"添加链接");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mi, L"图标大小");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)ms, L"排序方式");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)mt, L"主题");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN,
-                g_pinned ? L"取消钉住" : L"钉住");
-    AppendMenuW(m, MF_STRING | (g_hideOnFocus ? MF_CHECKED : 0), M_HIDEFOCUS, L"失焦自动隐藏");
-    AppendMenuW(m, MF_STRING, M_HOTKEY, L"快捷键设置…");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, M_EXIT, L"退出");
+    std::vector<MItem> mi, ms, mt, m;                    // 图标大小 / 排序方式 / 主题 / 主菜单
+    static const wchar_t* kIcon[3] = { L"小", L"中", L"大" };
+    static const wchar_t* kSort[3] = { L"添加顺序", L"名称升序", L"名称降序" };
+    static const wchar_t* kTheme[2] = { L"深色", L"浅色" };
+    for (int i = 0; i < 3; i++) MAdd(mi, M_ICON0 + i, kIcon[i], g_iconIdx == i);
+    for (int i = 0; i < 3; i++) MAdd(ms, M_SORT0 + i, kSort[i], g_sortMode == i);
+    for (int i = 0; i < 2; i++) MAdd(mt, M_THEME0 + i, kTheme[i], g_theme == i);
+    MAdd(m, M_ADDTAG, L"添加标签");
+    MAdd(m, M_ADDLINK, L"添加链接");
+    MSub(m, L"图标大小", mi);
+    MSub(m, L"排序方式", ms);
+    MSub(m, L"主题", mt);
+    MSep(m);
+    MAdd(m, M_PIN, g_pinned ? L"取消钉住" : L"钉住", g_pinned);
+    MAdd(m, M_HIDEFOCUS, L"失焦自动隐藏", g_hideOnFocus);
+    MAdd(m, M_HOTKEY, L"快捷键设置…");
+    MSep(m);
+    MAdd(m, M_EXIT, L"退出");
     RECT r = g_rcBtns[1];
-    int cmd = PopupMenuClient(m, { r.left, r.bottom + S(4) });
+    POINT s{ r.left, r.bottom + S(4) };
+    ClientToScreen(g_hwnd, &s);
+    int cmd = MPopup(std::move(m), s);
     switch (cmd) {
     case M_ADDTAG: OpenEditor(NT_TAG, 0, nullptr); break;
     case M_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
@@ -810,14 +1080,14 @@ static void ShowMainMenu() {
 
 static void ShowLinkMenu(Node* n, POINT scr) {
     bool hasDir = n->path.find(L'\\') != std::wstring::npos;
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, L_OPEN, L"打开");
-    AppendMenuW(m, MF_STRING, L_ADMIN, L"以管理员身份运行");
-    if (hasDir) AppendMenuW(m, MF_STRING, L_LOC, L"打开所在位置");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, L_EDIT, L"编辑");
-    AppendMenuW(m, MF_STRING, L_DEL, L"删除");
-    switch (PopupMenuScreen(m, scr)) {
+    std::vector<MItem> m;
+    MAdd(m, L_OPEN, L"打开");
+    MAdd(m, L_ADMIN, L"以管理员身份运行");
+    if (hasDir) MAdd(m, L_LOC, L"打开所在位置");
+    MSep(m);
+    MAdd(m, L_EDIT, L"编辑");
+    MAdd(m, L_DEL, L"删除");
+    switch (MPopup(std::move(m), scr)) {
     case L_OPEN: LaunchLink(n, false); break;
     case L_ADMIN: LaunchLink(n, true); break;
     case L_LOC: {
@@ -834,12 +1104,12 @@ static void ShowLinkMenu(Node* n, POINT scr) {
 }
 
 static void ShowTagMenu(Node* tag, POINT scr) {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, T_ADDLINK, L"添加链接");
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, T_REN, L"重命名");
-    AppendMenuW(m, MF_STRING, T_DEL, L"删除");
-    switch (PopupMenuScreen(m, scr)) {
+    std::vector<MItem> m;
+    MAdd(m, T_ADDLINK, L"添加链接");
+    MSep(m);
+    MAdd(m, T_REN, L"重命名");
+    MAdd(m, T_DEL, L"删除");
+    switch (MPopup(std::move(m), scr)) {
     case T_ADDLINK: OpenEditor(NT_LINK, tag->id, nullptr); break;
     case T_REN: OpenEditor(0, 0, tag); break;
     case T_DEL:
@@ -851,10 +1121,10 @@ static void ShowTagMenu(Node* tag, POINT scr) {
 }
 
 static void ShowGridBgMenu(POINT scr) {
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, BG_ADDLINK, L"添加链接");
-    AppendMenuW(m, MF_STRING, BG_ADDTAG, L"添加标签");
-    switch (PopupMenuScreen(m, scr)) {
+    std::vector<MItem> m;
+    MAdd(m, BG_ADDLINK, L"添加链接");
+    MAdd(m, BG_ADDTAG, L"添加标签");
+    switch (MPopup(std::move(m), scr)) {
     case BG_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
     case BG_ADDTAG:  OpenEditor(NT_TAG, 0, nullptr); break;
     }
@@ -1351,6 +1621,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_LBUTTONDOWN: {
+        if (!g_menuDone) { MenuCloseAll(); return 0; }   // 菜单展开时，首击只用于收起
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         Hit hh = HitTest(pt);
         switch (hh.reg) {
@@ -1374,6 +1645,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_CONTEXTMENU: {
+        if (!g_menuDone) { MenuCloseAll(); return 0; }   // 菜单展开时，首击只用于收起
         if ((HWND)w != h) break;
         POINT scr{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         if (scr.x == -1 && scr.y == -1) break;
@@ -1414,25 +1686,23 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_TIMER:
-        if (w == 1 && g_hideOnFocus && IsWindowVisible(h) && !g_pinned && !g_hDlg && !g_hHK) {
+        if (w == 1 && g_hideOnFocus && g_menuDone && IsWindowVisible(h) && !g_pinned && !g_hDlg && !g_hHK) {
             HWND fw = GetForegroundWindow();
             if (fw != h && (!fw || GetWindow(fw, GW_OWNER) != h)) HideWin();
         }
         break;
     case WM_HOTKEY:
-        if (w == 1) ToggleWin();
+        if (w == 1) { if (!g_menuDone) MenuCloseAll(); ToggleWin(); }
         break;
     case WM_TRAY: {
         if (LOWORD(l) == WM_LBUTTONUP) ToggleWin();
         else if (LOWORD(l) == WM_RBUTTONUP) {
             POINT pt; GetCursorPos(&pt);
-            HMENU mu = CreatePopupMenu();
-            AppendMenuW(mu, MF_STRING, TR_SHOW, IsWindowVisible(h) ? L"隐藏" : L"显示");
-            AppendMenuW(mu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(mu, MF_STRING, TR_EXIT, L"退出");
-            SetForegroundWindow(h);
-            int cmd = TrackPopupMenu(mu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
-            DestroyMenu(mu);
+            std::vector<MItem> mu;
+            MAdd(mu, TR_SHOW, IsWindowVisible(h) ? L"隐藏" : L"显示");
+            MSep(mu);
+            MAdd(mu, TR_EXIT, L"退出");
+            int cmd = MPopup(std::move(mu), pt, GetDesktopWindow());
             if (cmd == TR_SHOW) ToggleWin();
             if (cmd == TR_EXIT) Quit();
         }
@@ -1543,6 +1813,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     hk.hbrBackground = nullptr;
     hk.lpszClassName = HK_CLASS;
     RegisterClassW(&hk);
+
+    WNDCLASSW mc = {};                                    // 自绘菜单窗口类
+    mc.lpfnWndProc = MenuProc;
+    mc.hInstance = hInst;
+    mc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    mc.hbrBackground = nullptr;
+    mc.lpszClassName = MENU_CLASS;
+    RegisterClassW(&mc);
 
     MakeFonts();
     CreateGdiRes();
