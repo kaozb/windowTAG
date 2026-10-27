@@ -43,6 +43,7 @@ enum {
     M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT,
     M_ICON0 = 111, M_ICON1, M_ICON2,              // 图标 小/中/大
     M_SORT0 = 121, M_SORT1, M_SORT2,               // 排序 添加顺序/名称升/名称降
+    M_THEME0 = 131, M_THEME1,                      // 主题 深色/浅色
     L_OPEN = 201, L_ADMIN, L_LOC, L_EDIT, L_DEL,
     T_ADDLINK = 301, T_REN, T_DEL,
     BG_ADDTAG = 501, BG_ADDLINK,
@@ -94,20 +95,28 @@ static HDC g_memDC = nullptr; static HBITMAP g_memBmp = nullptr, g_memOld = null
 static int g_memW = 0, g_memH = 0;
 static ULONG_PTR g_gdipToken;
 
-// 配色（深色，取自用户提供的 Global 配色表）
-static const COLORREF C_BG    = RGB(32, 32, 32);      // main_bk 标题/标签栏
-static const COLORREF C_WHITE = RGB(255, 255, 255);
-static const COLORREF C_BAR   = RGB(51, 51, 51);      // main_client 内容面板
-static const COLORREF C_CARD  = RGB(59, 59, 59);      // link_item_bk_hot 卡片面
-static const COLORREF C_HOVER = RGB(69, 69, 69);      // 选中/悬停面
-static const COLORREF C_INSET = RGB(43, 43, 43);      // edit_bkcolor 输入内凹
-static const COLORREF C_SHAD  = RGB(0, 0, 0);         // 投影基色
-static const COLORREF C_TEXT  = RGB(255, 255, 255);   // textdefaultcolor
-static const COLORREF C_MUT   = RGB(146, 146, 146);   // edit_promptcolor
-static const COLORREF C_ACC   = RGB(120, 150, 180);   // main_title 主色
-static const COLORREF C_ONTXT = RGB(28, 32, 38);      // 主色上的深色文字（保对比度）
-static const COLORREF C_SPLIT = RGB(107, 107, 107);   // edit_bd_nml / link_item_bd_hot
-static const COLORREF C_EDGE  = RGB(36, 36, 36);      // main_bd 窗口描边
+// 配色：同一组语义槽位，两套值。0=深色（默认，取自用户提供的 Global 配色表）1=浅色
+static COLORREF C_BG, C_WHITE, C_BAR, C_CARD, C_HOVER, C_INSET, C_SHAD,
+                C_TEXT, C_MUT, C_ACC, C_ONTXT, C_SPLIT, C_EDGE;
+static int g_theme = 0;
+
+static void ApplyTheme(int idx) {
+    g_theme = (idx == 1) ? 1 : 0;
+    if (g_theme == 0) {
+        C_BG    = RGB(32, 32, 32); C_BAR  = RGB(51, 51, 51); C_CARD = RGB(59, 59, 59);
+        C_HOVER = RGB(69, 69, 69); C_INSET = RGB(43, 43, 43); C_SHAD = RGB(0, 0, 0);
+        C_TEXT  = RGB(255, 255, 255); C_MUT = RGB(146, 146, 146);
+        C_SPLIT = RGB(107, 107, 107); C_EDGE = RGB(36, 36, 36);
+    } else {
+        C_BG    = RGB(237, 237, 237); C_BAR = RGB(248, 248, 248); C_CARD = RGB(255, 255, 255);
+        C_HOVER = RGB(238, 244, 250); C_INSET = RGB(243, 243, 243); C_SHAD = RGB(70, 70, 70);
+        C_TEXT  = RGB(34, 34, 34); C_MUT = RGB(124, 124, 124);
+        C_SPLIT = RGB(212, 212, 212); C_EDGE = RGB(198, 198, 198);
+    }
+    C_WHITE = RGB(255, 255, 255);
+    C_ACC   = RGB(120, 150, 180);                       // 主色两套主题共用
+    C_ONTXT = RGB(28, 32, 38);                          // 主色上的深色文字（白字对比度仅 2.6:1）
+}
 
 // ---------------- 前向声明 ----------------
 static void Refresh();
@@ -119,7 +128,8 @@ static void GdipFillRound(gp::Graphics&, const RECT&, FLOAT, COLORREF, BYTE);
 static void GdipStrokeRound(gp::Graphics&, const RECT&, FLOAT, COLORREF, BYTE, FLOAT);
 static void GdipCard(gp::Graphics&, const RECT&, FLOAT, COLORREF);
 static void DrawDlgFace(HWND, HDC);
-static void EnableRoundedCorner(HWND, COLORREF);
+static bool EnableRoundedCorner(HWND, COLORREF);
+static void ApplyRoundRegion(HWND, bool);
 static void LaunchLink(Node* n, bool admin);
 static void OpenEditor(int type, int parent, const Node* src);
 static void HideWin();
@@ -158,6 +168,7 @@ static void SaveWinPos() {
     WritePrivateProfileStringW(L"ui", L"w", std::to_wstring(r.right - r.left).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"h", std::to_wstring(r.bottom - r.top).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"pinned", std::to_wstring(g_pinned ? 1 : 0).c_str(), g_iniConf.c_str());
+    WritePrivateProfileStringW(L"ui", L"theme", std::to_wstring(g_theme).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"ui", L"curTag", std::to_wstring(g_curTag).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideOnFocus", std::to_wstring(g_hideOnFocus ? 1 : 0).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideAfterLaunch", std::to_wstring(g_hideAfterLaunch ? 1 : 0).c_str(), g_iniConf.c_str());
@@ -403,6 +414,9 @@ static void MakeFonts() {
 }
 
 static void CreateGdiRes() {
+    if (g_brBg) DeleteObject(g_brBg);
+    if (g_brCard) DeleteObject(g_brCard);
+    if (g_brInset) DeleteObject(g_brInset);
     g_brBg    = CreateSolidBrush(C_BG);
     g_brCard  = CreateSolidBrush(C_CARD);
     g_brInset = CreateSolidBrush(C_INSET);
@@ -418,8 +432,9 @@ static int TitleH() { return S(46); }
 static int TagH()   { return S(40); }
 static int Gap()    { return S(8); }
 static int IconPx() { static const int k[3] = { 24, 32, 44 }; return S(k[g_iconIdx]); }
-static int CellW()  { static const int k[3] = { 88, 104, 124 }; return S(k[g_iconIdx]); }
-static int CellH()  { return S(14) + IconPx() + S(6) + S(18) + S(26); }
+static int CellW()  { static const int k[3] = { 92, 108, 128 }; return S(k[g_iconIdx]); }
+static int TextLineH() { return S(17); }
+static int CellH()  { return S(12) + IconPx() + S(6) + TextLineH() * 2 + S(12); }
 
 // 内容面板：卡片布局的唯一坐标基准（画板、卡片、滚动范围都从这里算，避免互相越界）
 static RECT PanelRect() {
@@ -708,6 +723,7 @@ static void OpenEditor(int type, int parent, const Node* src) {
                              g_hwnd, nullptr, g_hInst, (LPVOID)(INT_PTR)g_ctx.type);
     if (g_hDlg) {
         EnableRoundedCorner(g_hDlg, C_EDGE);
+        ApplyRoundRegion(g_hDlg, true);          // 无边框弹窗 DWM 不圆角，直接用区域兜底
         FadeIn(g_hDlg, 120);
     }
 }
@@ -739,10 +755,16 @@ static void ShowMainMenu() {
         static const wchar_t* kTxt[3] = { L"添加顺序", L"名称升序", L"名称降序" };
         AppendMenuW(ms, MF_STRING | (g_sortMode == i ? MF_CHECKED : 0), M_SORT0 + i, kTxt[i]);
     }
+    HMENU mt = CreatePopupMenu();                        // 主题
+    for (int i = 0; i < 2; i++) {
+        static const wchar_t* kTxt[2] = { L"深色", L"浅色" };
+        AppendMenuW(mt, MF_STRING | (g_theme == i ? MF_CHECKED : 0), M_THEME0 + i, kTxt[i]);
+    }
     AppendMenuW(m, MF_STRING, M_ADDTAG, L"添加标签");
     AppendMenuW(m, MF_STRING, M_ADDLINK, L"添加链接");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)mi, L"图标大小");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)ms, L"排序方式");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mt, L"主题");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (g_pinned ? MF_CHECKED : 0), M_PIN,
                 g_pinned ? L"取消钉住" : L"钉住");
@@ -770,6 +792,14 @@ static void ShowMainMenu() {
             WritePrivateProfileStringW(L"ui", L"sort", std::to_wstring(g_sortMode).c_str(),
                                        g_iniConf.c_str());
             Refresh();
+        } else if (cmd >= M_THEME0 && cmd <= M_THEME1) {
+            ApplyTheme(cmd - M_THEME0);
+            CreateGdiRes();                              // 画刷跟着主题重建
+            EnableRoundedCorner(g_hwnd, C_EDGE);         // 标题栏/描边色同步
+            ApplyRoundRegion(g_hwnd, false);
+            WritePrivateProfileStringW(L"ui", L"theme", std::to_wstring(g_theme).c_str(),
+                                       g_iniConf.c_str());
+            InvalidateRect(g_hwnd, nullptr, TRUE);
         }
         break;
     }
@@ -840,6 +870,41 @@ static void DrawGlyph(HDC dc, const RECT& r, wchar_t g, COLORREF c) {
     DrawTextRect(dc, r, s, g_fGlyph, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
 
+// 按宽度折行：优先在空格断，否则逐字断；行数超限时末行截断并补省略号
+static std::vector<std::wstring> WrapText(HDC dc, const std::wstring& s, int maxW, int maxLines) {
+    std::vector<std::wstring> lines;
+    if (s.empty() || maxW <= 0) return lines;
+    HFONT of = (HFONT)SelectObject(dc, g_fUi);
+    auto W = [&](const std::wstring& t) {
+        SIZE sz{}; GetTextExtentPoint32W(dc, t.c_str(), (int)t.size(), &sz); return (int)sz.cx;
+    };
+    std::wstring cur;
+    for (wchar_t ch : s) {
+        std::wstring nx = cur + ch;
+        if (!cur.empty() && W(nx) > maxW) {
+            size_t sp = cur.find_last_of(L' ');
+            if (sp != std::wstring::npos && sp > 0) {
+                lines.push_back(cur.substr(0, sp));
+                cur = cur.substr(sp + 1) + ch;
+            } else {
+                lines.push_back(cur);
+                cur = std::wstring(1, ch);
+            }
+        } else {
+            cur = nx;
+        }
+    }
+    if (!cur.empty()) lines.push_back(cur);
+    if ((int)lines.size() > maxLines) {
+        lines.resize(maxLines);
+        std::wstring last = lines.back();
+        while (!last.empty() && W(last + L"…") > maxW) last.pop_back();
+        lines.back() = last + L"…";
+    }
+    SelectObject(dc, of);
+    return lines;
+}
+
 // ---------------- GDI+ 抗锯齿绘制 ----------------
 static gp::Color Col(COLORREF c, BYTE a) {
     return gp::Color(a, GetRValue(c), GetGValue(c), GetBValue(c));
@@ -877,29 +942,43 @@ static void GdipStrokeRound(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF 
     g.DrawPath(&pen, &p);
 }
 
-// 轻拟物浮起卡片：3 层暖影 + 本体 + 1px 高光描边
+// 轻拟物浮起卡片：3 层淡影 + 本体 + 1px 高光描边（浅色主题需要更重的投影才看得出浮起）
 static void GdipCard(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF body) {
+    int base = (g_theme == 0) ? 21 : 30;
     for (int i = 1; i <= 3; i++) {
         RECT rs{ r.left, r.top + i, r.right, r.bottom + i };
-        GdipFillRound(g, rs, rad, C_SHAD, (BYTE)(21 - i * 6));
+        GdipFillRound(g, rs, rad, C_SHAD, (BYTE)(base - i * 6));
     }
     GdipFillRound(g, r, rad, body, 255);
-    GdipStrokeRound(g, r, rad, C_WHITE, 22, 1.0f);       // 深色底上极淡高光
+    GdipStrokeRound(g, r, rad, C_WHITE, 22, 1.0f);
 }
 
-// Win11 系统圆角窗口 + 描边色；Win10 无此属性，静默跳过
-static void EnableRoundedCorner(HWND h, COLORREF border) {
+// Win11 系统圆角窗口 + 描边色；返回是否成功（Win10 无此属性，syscall 返回错误码）
+static bool EnableRoundedCorner(HWND h, COLORREF border) {
     typedef LONG (WINAPI *PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
     static PFN_DwmSetWindowAttribute fn = []() -> PFN_DwmSetWindowAttribute {
         HMODULE m = LoadLibraryW(L"dwmapi.dll");
         return m ? (PFN_DwmSetWindowAttribute)GetProcAddress(m, "DwmSetWindowAttribute") : nullptr;
     }();
-    if (!fn) return;
+    if (!fn) return false;
     LONG pref = 2;                                        // DWMWCP_ROUND
-    fn(h, 33, &pref, sizeof pref);                        // DWMWA_WINDOW_CORNER_PREFERENCE
+    HRESULT hr = fn(h, 33, &pref, sizeof pref);           // DWMWA_WINDOW_CORNER_PREFERENCE
     COLORREF cap = C_BG;
     fn(h, 35, &cap, sizeof cap);                          // DWMWA_CAPTION_COLOR 兜底
     fn(h, 34, &border, sizeof border);                    // DWMWA_BORDER_COLOR 描边
+    return SUCCEEDED(hr);
+}
+
+// 无 DWM 圆角的场景（Win10 / 无边框弹窗）用窗口区域兜底，否则四角是直角
+static bool g_dwmRound = false;                          // 主窗口是否已由 DWM 提供抗锯齿圆角
+static void ApplyRoundRegion(HWND h, bool force) {
+    if (!force && g_dwmRound) { SetWindowRgn(h, nullptr, TRUE); return; }
+    RECT rc; GetClientRect(h, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) return;
+    if (IsZoomed(h)) { SetWindowRgn(h, nullptr, TRUE); return; }   // 最大化不切角
+    int rad = S(16);
+    HRGN r = CreateRoundRectRgn(0, 0, rc.right + 1, rc.bottom + 1, rad, rad);
+    if (r) SetWindowRgn(h, r, TRUE);                     // 成功后 region 归系统所有，不可删除
 }
 
 static void PaintAll(HDC dc) {
@@ -972,12 +1051,18 @@ static void PaintAll(HDC dc) {
             bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i);
             GdipCard(gc, r, S(12), hot ? C_HOVER : C_CARD);
             HICON ic = IconFor(*g_view[i]);
-            if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, r.top + S(14), ic,
+            int iy = r.top + S(12);
+            if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, iy, ic,
                                isz, isz, 0, nullptr, DI_NORMAL);
-            RECT nr{ r.left + S(6), r.top + S(14) + isz + S(6), r.right - S(6),
-                     r.top + S(14) + isz + S(6) + S(18) };
-            DrawTextRect(dc, nr, g_view[i]->name.c_str(), g_fUi, C_TEXT,
-                         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            int ty = iy + isz + S(6);
+            auto lines = WrapText(dc, g_view[i]->name, CellW() - S(12), 2);
+            if (lines.size() == 1) ty += TextLineH() / 2;      // 单行时垂直居中，不贴顶
+            for (size_t k = 0; k < lines.size(); k++) {
+                RECT lr{ r.left + S(6), ty + (int)k * TextLineH(),
+                         r.right - S(6), ty + (int)(k + 1) * TextLineH() };
+                DrawTextRect(dc, lr, lines[k].c_str(), g_fUi, C_TEXT,
+                             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
         }
         RestoreDC(dc, saved);
     }
@@ -1140,6 +1225,7 @@ static void OpenHotkeyDlg() {
                             cw, ch, g_hwnd, nullptr, g_hInst, nullptr);
     if (g_hHK) {
         EnableRoundedCorner(g_hHK, C_EDGE);
+        ApplyRoundRegion(g_hHK, true);
         FadeIn(g_hHK, 120);
     }
 }
@@ -1218,7 +1304,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_ERASEBKGND: return 1;
-    case WM_SIZE: LayoutNow(); InvalidateRect(h, nullptr, FALSE); break;
+    case WM_SIZE: LayoutNow(); ApplyRoundRegion(h, false); InvalidateRect(h, nullptr, FALSE); break;
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)l;
         mmi->ptMinTrackSize = { S(430), S(340) };
@@ -1411,6 +1497,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_pinned           = GetPrivateProfileIntW(L"ui", L"pinned", 0, g_iniConf.c_str()) != 0;
     g_iconIdx          = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"iconSize", 1, g_iniConf.c_str())));
     g_sortMode         = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"sort", 0, g_iniConf.c_str())));
+    ApplyTheme((int)GetPrivateProfileIntW(L"ui", L"theme", 0, g_iniConf.c_str()));   // 深色为默认
     g_startHidden      = GetPrivateProfileIntW(L"behavior", L"startHidden", 0, g_iniConf.c_str()) != 0;
     int wx = GetPrivateProfileIntW(L"ui", L"x", -32000, g_iniConf.c_str());
     int wy = GetPrivateProfileIntW(L"ui", L"y", -32000, g_iniConf.c_str());
@@ -1468,6 +1555,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     if (!g_hwnd) return 1;
     g_dpi = (int)WindowDpi(g_hwnd);
     MakeFonts();                                            // 按实际 DPI 重做字体
+    g_dwmRound = EnableRoundedCorner(g_hwnd, C_EDGE);       // Win11 走 DWM 抗锯齿圆角
+    ApplyRoundRegion(g_hwnd, false);                        // Win10 无该属性时用区域兜底
     Refresh();
     if (g_pinned) ApplyPin();
     // 强制 DWM 立即按我们的 NCCALCSIZE 重排非客户区（否则首帧残留系统标题栏，resize 后才消失）
