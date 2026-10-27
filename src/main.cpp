@@ -86,7 +86,6 @@ static int  g_hoverReg = R_NONE, g_hoverIdx = -1;
 
 static std::wstring g_iniConf, g_iniLinks;
 static NOTIFYICONDATAW g_nid = {};
-static HHOOK g_mouseHook = nullptr;     // 鼠标触发热键的低级钩子（Quit 需早于定义处引用）
 
 // 布局区域
 static RECT g_rcTitle, g_rcTag, g_rcGrid;
@@ -204,7 +203,6 @@ static void SaveWinPos() {
 
 static void Quit() {
     StopListener();
-    if (g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
     SaveWinPos();
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     DestroyWindow(g_hwnd);
@@ -1388,51 +1386,6 @@ static const wchar_t HK_CLASS[] = L"LNP_HotkeyWnd";
 struct HKState { int mod = 0, vk = 0; };
 static HKState g_hk;
 
-// 鼠标触发热键（键盘热键机制覆盖不了的输入）：0=无 1=中键 2=中键双击 3=侧键后退 4=侧键前进
-static int g_hotMouse = 0;
-static RECT g_hkMouse;                   // 快捷键对话框里的鼠标触发行
-static const UINT WM_HOTMOUSE = WM_APP + 3;
-
-static const wchar_t* MouseHotName(int v) {
-    static const wchar_t* k[] = { L"无", L"鼠标中键", L"鼠标中键双击", L"鼠标侧键·后退", L"鼠标侧键·前进" };
-    return (v >= 0 && v <= 4) ? k[v] : k[0];
-}
-
-// 低级钩子只快速判断并 Post，UI 动作在主循环做——钩子里做耗时操作会卡住全系统鼠标
-static LRESULT CALLBACK MouseHookProc(int code, WPARAM w, LPARAM l) {
-    if (code == HC_ACTION && g_hotMouse) {
-        HWND fg = GetForegroundWindow();
-        DWORD pid = 0;
-        GetWindowThreadProcessId(fg, &pid);
-        if (pid != GetCurrentProcessId()) {              // 本进程前台（主窗/对话框/菜单）不误触
-            MSLLHOOKSTRUCT* e = (MSLLHOOKSTRUCT*)l;
-            static DWORD lastDown = 0;                   // 中键双击检测
-            static POINT lastPt{};
-            bool hit = false;
-            if (g_hotMouse == 1 && w == WM_MBUTTONUP) hit = true;
-            else if (g_hotMouse == 2 && w == WM_MBUTTONDOWN) {
-                if (lastDown && GetTickCount() - lastDown <= GetDoubleClickTime() &&
-                    abs(e->pt.x - lastPt.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
-                    abs(e->pt.y - lastPt.y) <= GetSystemMetrics(SM_CYDOUBLECLK)) {
-                    hit = true; lastDown = 0;
-                } else { lastDown = GetTickCount(); lastPt = e->pt; }
-            }
-            else if (g_hotMouse == 3 && w == WM_XBUTTONUP && HIWORD(e->mouseData) == XBUTTON1) hit = true;
-            else if (g_hotMouse == 4 && w == WM_XBUTTONUP && HIWORD(e->mouseData) == XBUTTON2) hit = true;
-            if (hit) PostMessageW(g_hwnd, WM_HOTMOUSE, 0, 0);
-        }
-    }
-    return CallNextHookEx(nullptr, code, w, l);
-}
-
-static void ApplyMouseHot(int v) {
-    g_hotMouse = v;
-    wchar_t b[16]; wsprintfW(b, L"%d", v);
-    WritePrivateProfileStringW(L"hot", L"mouse", b, g_iniConf.c_str());
-    if (v && !g_mouseHook) g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc, g_hInst, 0);
-    if (!v && g_mouseHook) { UnhookWindowsHookEx(g_mouseHook); g_mouseHook = nullptr; }
-}
-
 static std::wstring HotkeyText(int mod, int vk) {
     std::wstring s;
     if (mod & MOD_CONTROL) s += L"Ctrl+";
@@ -1476,7 +1429,6 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         CreateWindowExW(0, L"STATIC", HotkeyText(g_hk.mod, g_hk.vk).c_str(),
                         WS_CHILD | WS_VISIBLE | SS_CENTER, S(16), S(66), S(300) - S(32), S(28),
                         h, (HMENU)(INT_PTR)1, g_hInst, nullptr);
-        g_hkMouse = { S(16), S(100), S(300) - S(16), S(122) };
         g_dlgBtns.clear(); g_dlgEdits.clear();
         g_dlgBtns.push_back({ { S(300) - S(16) - S(88) * 2 - S(8), S(128),
                                 S(300) - S(16) - S(88) - S(8), S(156) }, IDOK, L"确定", true });
@@ -1484,15 +1436,6 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                                 S(300) - S(16), S(156) }, IDCANCEL, L"取消", false });
         g_rcDlgX = { S(300) - S(40), 0, S(300) - S(8), S(36) };
         SetFocus(h);
-        return 0;
-    }
-    case WM_PAINT: {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
-        DrawDlgFace(h, dc);
-        std::wstring mt = std::wstring(L"鼠标触发：") + MouseHotName(g_hotMouse) + L"  ▸";
-        DrawTextRect(dc, g_hkMouse, mt.c_str(), g_fUiB, C_ACC,
-                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        EndPaint(h, &ps);
         return 0;
     }
     case WM_NCACTIVATE:
@@ -1514,17 +1457,6 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SendMessageW(h, WM_COMMAND, b->id, 0);
             return 0;
         }
-        if (PtInRect(&g_hkMouse, pt)) {                  // 鼠标触发：向右侧展开二级菜单
-            std::vector<MItem> mm;
-            for (int i = 0; i <= 4; i++) MAdd(mm, 300 + i, MouseHotName(i), g_hotMouse == i);
-            RECT r = g_hkMouse;
-            POINT sp{ r.right + S(4), r.top };
-            ClientToScreen(h, &sp);
-            int v = MPopup(std::move(mm), sp, h);
-            if (v >= 300 && v <= 304) ApplyMouseHot(v - 300);
-            InvalidateRect(h, nullptr, TRUE);
-            return 0;
-        }
         if (pt.y < S(36)) {
             ReleaseCapture();
             SendMessageW(h, WM_NCLBUTTONDOWN, HTCAPTION, 0);
@@ -1534,7 +1466,7 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SETCURSOR: {
         if (LOWORD(l) == HTCLIENT) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
-            bool hand = PtInRect(&g_rcDlgX, pt) || PtInRect(&g_hkMouse, pt) || FindDlgBtn(pt);
+            bool hand = PtInRect(&g_rcDlgX, pt) || FindDlgBtn(pt);
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
@@ -2249,10 +2181,6 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_HOTKEY:
         if (w == 1) { if (!g_menuDone) MenuCloseAll(); ToggleWin(); }
         break;
-    case WM_HOTMOUSE:                                     // 鼠标触发热键（低级钩子 Post 来的）
-        if (!g_menuDone) MenuCloseAll();
-        ToggleWin();
-        break;
     case WM_TRAY: {
         if (LOWORD(l) == WM_LBUTTONUP) ToggleWin();
         else if (LOWORD(l) == WM_RBUTTONUP) {
@@ -2428,7 +2356,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     if (!g_startHidden) ShowWin();
-    ApplyMouseHot(std::min(4, std::max(0, (int)GetPrivateProfileIntW(L"hot", L"mouse", 0, g_iniConf.c_str()))));
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
