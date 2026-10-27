@@ -1752,19 +1752,40 @@ static void StopListener() {
 static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_ERASEBKGND: return 1;
+    case WM_LBUTTONDOWN:                                   // 主动点击：立即消失
+        KillTimer(h, 1);
+        FadeOut(h, 120);
+        return 0;
+    case WM_SETCURSOR:
+        SetCursor(LoadCursorW(nullptr, IDC_HAND));
+        return TRUE;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
-        FillRect(dc, &rc, g_brCard);
         gp::Graphics g(dc); GdipSetup(g);
-        GdipStrokeRound(g, rc, S(12), C_SPLIT, 160, 1.0f);
+        // 饱和渐变底 + 白描边：纯白（浏览器）/纯黑桌面上都一眼可见
+        gp::GraphicsPath p;
+        GdipPathRound(p, gp::RectF(0, 0, (FLOAT)rc.right, (FLOAT)rc.bottom), (FLOAT)S(14));
+        gp::LinearGradientBrush br(gp::PointF(0, 0),
+                                   gp::PointF((FLOAT)rc.right, (FLOAT)rc.bottom),
+                                   gp::Color(255, 70, 110, 225),
+                                   gp::Color(255, 168, 68, 205));
+        g.FillPath(&br, &p);
+        GdipStrokeRound(g, rc, S(14), C_WHITE, 210, 1.5f);
+        // 顶部小标签 + 底部操作提示
+        DrawGlyph(dc, { S(12), S(8), S(30), S(26) }, 0xE8BD, RGB(225, 232, 255));
+        DrawTextRect(dc, { S(32), S(8), rc.right - S(12), S(26) }, L"消息",
+                     g_fSmall, RGB(225, 232, 255), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextRect(dc, { 0, rc.bottom - S(22), rc.right, rc.bottom - S(6) }, L"点击关闭",
+                     g_fSmall, RGB(220, 228, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         std::wstring txt = g_msgText.empty() ? L"(空消息)" : g_msgText;
         auto lines = WrapText(dc, txt, rc.right - S(36), 3);
+        int top = S(28);
         int tot = (int)lines.size() * TextLineH();
-        int y = rc.top + (rc.bottom - rc.top - tot) / 2;
+        int y = top + (rc.bottom - S(24) - top - tot) / 2;
         for (size_t i = 0; i < lines.size(); i++) {
             RECT lr{ S(18), y + (int)i * TextLineH(), rc.right - S(18), y + (int)(i + 1) * TextLineH() };
-            DrawTextRect(dc, lr, lines[i].c_str(), g_fUi, C_TEXT,
+            DrawTextRect(dc, lr, lines[i].c_str(), g_fUiB, C_WHITE,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         EndPaint(h, &ps);
@@ -1799,7 +1820,7 @@ static void ShowToast(const std::wstring& text) {
     SetWindowPos(g_hToast, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
     FadeIn(g_hToast, 120, SW_SHOWNOACTIVATE);
     InvalidateRect(g_hToast, nullptr, FALSE);
-    SetTimer(g_hToast, 1, 3500, nullptr);
+    SetTimer(g_hToast, 1, 5000, nullptr);
 }
 
 // ---------------- 监听设置对话框 ----------------
