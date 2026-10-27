@@ -766,6 +766,7 @@ struct MPanel {
     HWND hwnd = nullptr;
     HWND owner = nullptr;
     MPanel* child = nullptr;
+    int src = -1;                             // 子菜单来自哪一条目（用于切换子菜单）
     POINT pos{};
     HDC dc = nullptr; HBITMAP bmp = nullptr, oldBmp = nullptr; void* bits = nullptr;
 };
@@ -877,7 +878,8 @@ static void MenuCommit(MPanel* p) {
     UpdateLayeredWindow(p->hwnd, nullptr, &dst, &sz, p->dc, &src, 0, &bf, ULW_ALPHA);
 }
 
-static void MenuShow(MPanel* p, POINT at) {
+// activate=false 用于子菜单：不抢激活，父面板就不会收到 WA_INACTIVE 而误收起整套菜单
+static void MenuShow(MPanel* p, POINT at, bool activate) {
     p->pos = at;
     g_panels.push_back(p);
     p->hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, MENU_CLASS, L"",
@@ -885,8 +887,8 @@ static void MenuShow(MPanel* p, POINT at) {
     if (!p->hwnd) return;
     MenuRender(p);
     MenuCommit(p);
-    ShowWindow(p->hwnd, SW_SHOW);
-    SetForegroundWindow(p->hwnd);
+    ShowWindow(p->hwnd, activate ? SW_SHOW : SW_SHOWNOACTIVATE);
+    if (activate) SetForegroundWindow(p->hwnd);
 }
 
 static void MenuFree(MPanel* p) {
@@ -915,7 +917,10 @@ static void MenuCloseAll() {
 }
 
 static void MenuOpenSub(MPanel* p, int idx) {
-    if (p->child) return;
+    if (p->child) {                          // 已开着子菜单：同一条目保持，换条目就切换
+        if (p->child->src == idx) return;
+        MenuCloseSub(p);
+    }
     MPanel* c = new MPanel;
     c->items = p->items[idx].sub;
     c->owner = p->owner;
@@ -927,8 +932,9 @@ static void MenuOpenSub(MPanel* p, int idx) {
     GetMonitorInfoW(MonitorFromPoint({ x, y }, MONITOR_DEFAULTTONEAREST), &mi);
     if (x + c->sw > mi.rcWork.right) x = pr.left - c->sw + MenuM() + S(6);   // 右边放不下就翻到左侧
     if (y + c->sh > mi.rcWork.bottom) y = mi.rcWork.bottom - c->sh;
+    c->src = idx;
     p->child = c;
-    MenuShow(c, { x, y });
+    MenuShow(c, { x, y }, false);
 }
 
 static LRESULT CALLBACK MenuProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -990,10 +996,10 @@ static LRESULT CALLBACK MenuProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         break;
     case WM_ACTIVATE: {
         if (LOWORD(w) != WA_INACTIVE || g_menuClosing) break;
-        HWND a = GetActiveWindow();
-        bool ours = false;
-        for (auto* q : g_panels) if (q->hwnd == a) ours = true;
-        if (!ours) MenuCloseAll();                   // 点到别处：收起整套菜单
+        HWND a = GetForegroundWindow();               // 激活切到本进程内的窗口（主窗口/别的菜单面板）不算离开
+        if (!a) break;
+        DWORD pid = 0; GetWindowThreadProcessId(a, &pid);
+        if (pid != GetCurrentProcessId()) MenuCloseAll();   // 切到别的程序：收起整套菜单
         break;
     }
     }
@@ -1013,7 +1019,7 @@ static int MPopup(std::vector<MItem> items, POINT scr, HWND owner = nullptr) {
     int x = scr.x, y = scr.y;
     if (x + p->sw > mi.rcWork.right)  x = mi.rcWork.right - p->sw;
     if (y + p->sh > mi.rcWork.bottom) y = mi.rcWork.bottom - p->sh;
-    MenuShow(p, { x, y });
+    MenuShow(p, { x, y }, true);
     if (p->hwnd) SetTimer(p->hwnd, 1, 20, nullptr);
     MSG msg;
     while (!g_menuDone && GetMessageW(&msg, nullptr, 0, 0) > 0) {
