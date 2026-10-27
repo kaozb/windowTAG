@@ -43,12 +43,13 @@ enum { R_NONE = 0, R_TITLE, R_TAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN, R
 
 struct Node {
     int id = 0, type = 0, parent = 0;
+    int order = 0;                        // 拖拽排序键（旧文件缺省 = 读入序）
     std::wstring name, path, params;
 };
 
 // 菜单命令 ID
 enum {
-    M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_HOTKEY, M_EXIT, M_LISTEN,
+    M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_AUTOSTART, M_HOTKEY, M_EXIT, M_LISTEN,
     M_ICON0 = 111, M_ICON1, M_ICON2,              // 图标 小/中/大
     M_SORT0 = 121, M_SORT1, M_SORT2,               // 排序 添加顺序/名称升/名称降
     M_THEME0 = 131, M_THEME1,                      // 主题 深色/浅色
@@ -81,8 +82,12 @@ static int  g_iconIdx = 1;              // 图标大小：0 小 / 1 中 / 2 大
 static int  g_sortMode = 0;             // 排序：0 添加顺序 / 1 名称升序 / 2 名称降序
 
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
+static bool g_autoStart = true;         // 开机自启（HKCU Run），默认开
 static bool g_tracking = false, g_startHidden = false;
 static int  g_hoverReg = R_NONE, g_hoverIdx = -1;
+static int  g_pressIdx = -1;            // 左键按下的网格单元：拖拽/单击共用起点
+static bool g_dragging = false;
+static POINT g_pressPt{};
 
 static std::wstring g_iniConf, g_iniLinks;
 static NOTIFYICONDATAW g_nid = {};
@@ -199,6 +204,7 @@ static void SaveWinPos() {
     WritePrivateProfileStringW(L"ui", L"curTag", std::to_wstring(g_curTag).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideOnFocus", std::to_wstring(g_hideOnFocus ? 1 : 0).c_str(), g_iniConf.c_str());
     WritePrivateProfileStringW(L"behavior", L"hideAfterLaunch", std::to_wstring(g_hideAfterLaunch ? 1 : 0).c_str(), g_iniConf.c_str());
+    WritePrivateProfileStringW(L"behavior", L"autostart", std::to_wstring(g_autoStart ? 1 : 0).c_str(), g_iniConf.c_str());
 }
 
 static void Quit() {
@@ -206,6 +212,26 @@ static void Quit() {
     SaveWinPos();
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
     DestroyWindow(g_hwnd);
+}
+
+// ---------------- 开机自启（HKCU\...\Run；随开关写/删，路径变化时自动刷新） ----------------
+static void ApplyAutoStart(bool on) {
+    HKEY k;
+    if (on) {
+        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                            0, nullptr, 0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) return;
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\"";   // 加引号防空格路径被截断
+        RegSetValueExW(k, L"windowTAG", 0, REG_SZ, (const BYTE*)cmd.c_str(),
+                       (DWORD)(cmd.size() + 1) * sizeof(wchar_t));
+        RegCloseKey(k);
+    } else {
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                          0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+        RegDeleteValueW(k, L"windowTAG");
+        RegCloseKey(k);
+    }
 }
 
 // ---------------- 节点持久化 ----------------
@@ -218,6 +244,7 @@ static void SaveNode(const Node& n) {
     wchar_t sec[32]; wsprintfW(sec, L"node.%d", n.id);
     WritePrivateProfileStringW(sec, L"type",   std::to_wstring(n.type).c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"parent", std::to_wstring(n.parent).c_str(), g_iniLinks.c_str());
+    WritePrivateProfileStringW(sec, L"order",  std::to_wstring(n.order).c_str(),  g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"name",   n.name.c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"path",   n.path.c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"params", n.params.c_str(), g_iniLinks.c_str());
@@ -252,6 +279,7 @@ static void Seed() {
     Node t; t.id = 1; t.type = NT_TAG; t.name = L"常用";
     Node l; l.id = 2; l.type = NT_LINK; l.parent = 1; l.name = L"腾讯文档"; l.path = L"https://docs.qq.com";
     g_nodes = { t, l };
+    for (int i = 0; i < (int)g_nodes.size(); i++) g_nodes[i].order = i;
     g_curTag = 1;
     g_nextId = 3;
     for (auto& n : g_nodes) SaveNode(n);
@@ -270,12 +298,36 @@ static void LoadNodes() {
         n.id = i;
         n.type = _wtoi(buf);
         n.parent = GetPrivateProfileIntW(sec, L"parent", 0, g_iniLinks.c_str());
+        n.order  = GetPrivateProfileIntW(sec, L"order", i, g_iniLinks.c_str());
         GetPrivateProfileStringW(sec, L"name", L"", buf, 1024, g_iniLinks.c_str());   n.name = buf;
         GetPrivateProfileStringW(sec, L"path", L"", buf, 1024, g_iniLinks.c_str());   n.path = buf;
         GetPrivateProfileStringW(sec, L"params", L"", buf, 1024, g_iniLinks.c_str()); n.params = buf;
         g_nodes.push_back(n);
     }
+    std::stable_sort(g_nodes.begin(), g_nodes.end(),
+                     [](const Node& a, const Node& b) { return a.order < b.order; });
     if (g_nodes.empty()) Seed();
+}
+
+// 拖拽结束后按 g_nodes 现顺序重排 order 键并落盘
+static void SaveOrders() {
+    for (int i = 0; i < (int)g_nodes.size(); i++) {
+        if (g_nodes[i].order != i) { g_nodes[i].order = i; SaveNode(g_nodes[i]); }
+    }
+}
+
+// 把视图里 from 位置的链接实时移到 to 位置；g_nodes 与 g_view 同步换位（元素地址不变，指针不失效）
+static void DragMove(int from, int to) {
+    if (from < 0 || to < 0 || from >= (int)g_view.size() || to >= (int)g_view.size() || from == to) return;
+    Node* src = const_cast<Node*>(g_view[from]);
+    Node* dst = const_cast<Node*>(g_view[to]);
+    if (from < to) std::rotate(g_view.begin() + from, g_view.begin() + from + 1, g_view.begin() + to + 1);
+    else           std::rotate(g_view.begin() + to, g_view.begin() + from, g_view.begin() + from + 1);
+    auto si = std::find_if(g_nodes.begin(), g_nodes.end(), [&](const Node& n) { return &n == src; });
+    auto di = std::find_if(g_nodes.begin(), g_nodes.end(), [&](const Node& n) { return &n == dst; });
+    if (si == g_nodes.end() || di == g_nodes.end()) return;
+    if (si < di) std::rotate(si, si + 1, di + 1);
+    else         std::rotate(di, si, si + 1);
 }
 
 // ---------------- 视图 ----------------
@@ -306,7 +358,7 @@ static int EnsureCurTag() {
     if (g_curTag) return g_curTag;
     auto tl = TagList();
     if (!tl.empty()) return tl[0]->id;
-    Node t; t.id = g_nextId++; t.type = NT_TAG; t.name = L"常用";
+    Node t; t.id = g_nextId++; t.type = NT_TAG; t.name = L"常用"; t.order = (int)g_nodes.size();
     g_nodes.push_back(t); SaveNode(t); SaveNextId();
     g_curTag = t.id;
     return t.id;
@@ -567,6 +619,7 @@ static void EditorApply() {
         Node n;
         n.id = g_nextId++; n.type = g_ctx.type; n.parent = g_ctx.parent;
         n.name = g_ctx.name; n.path = g_ctx.path; n.params = g_ctx.params;
+        n.order = (int)g_nodes.size();
         g_nodes.push_back(n); SaveNode(n); SaveNextId();
         if (n.type == NT_TAG) g_curTag = n.id;
     } else if (Node* n = Find(g_ctx.id)) {
@@ -1070,6 +1123,7 @@ static void ShowMainMenu() {
     MSep(m);
     MAdd(m, M_PIN, g_pinned ? L"取消钉住" : L"钉住", g_pinned);
     MAdd(m, M_HIDEFOCUS, L"失焦自动隐藏", g_hideOnFocus);
+    MAdd(m, M_AUTOSTART, L"开机自启", g_autoStart);
     MAdd(m, M_HOTKEY, L"快捷键设置…");
     MAdd(m, M_LISTEN, L"监听设置…");
     MSep(m);
@@ -1083,6 +1137,11 @@ static void ShowMainMenu() {
     case M_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
     case M_PIN: g_pinned = !g_pinned; ApplyPin(); SaveWinPos(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     case M_HIDEFOCUS: g_hideOnFocus = !g_hideOnFocus; SaveWinPos(); break;
+    case M_AUTOSTART:
+        g_autoStart = !g_autoStart;
+        ApplyAutoStart(g_autoStart);
+        SaveWinPos();
+        break;
     case M_HOTKEY: OpenHotkeyDlg(); break;
     case M_LISTEN: OpenListenDlg(); break;
     case M_EXIT: Quit(); break;
@@ -1353,8 +1412,10 @@ static void PaintAll(HDC dc) {
         for (int i = 0; i < (int)g_view.size(); i++) {
             RECT r = CellRect(i);
             if (r.bottom < inner.top || r.top > inner.bottom) continue;
-            bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i);
-            GdipCard(gc, r, S(12), hot ? C_HOVER : C_CARD);
+            bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i && !(g_dragging && g_pressIdx == i));
+            bool drag = (g_dragging && g_pressIdx == i);
+            GdipCard(gc, r, S(12), (hot || drag) ? C_HOVER : C_CARD);
+            if (drag) GdipStrokeRound(gc, r, S(12), C_ACC, 255, 2.0f);   // 拖拽中的卡片描主色边
             HICON ic = IconFor(*g_view[i]);
             int iy = r.top + S(12);
             if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, iy, ic,
@@ -2080,6 +2141,18 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         Hit hh = HitTest(pt);
+        if (g_pressIdx >= 0) {                            // 按住左键：先判定拖拽，松手未拖则按单击处理
+            if (!g_dragging &&
+                (abs(pt.x - g_pressPt.x) > S(6) || abs(pt.y - g_pressPt.y) > S(6)))
+                g_dragging = (g_sortMode == 0);           // 名称排序下拖不出可见效果，禁用拖拽
+            if (g_dragging && hh.reg == R_CELL && hh.idx != g_pressIdx) {
+                DragMove(g_pressIdx, hh.idx);             // 实时换位
+                g_pressIdx = hh.idx;
+            }
+            if (g_dragging) { g_hoverReg = R_CELL; g_hoverIdx = g_pressIdx; }
+            InvalidateRect(h, nullptr, FALSE);
+            break;
+        }
         if (hh.reg != g_hoverReg || hh.idx != g_hoverIdx) {
             g_hoverReg = hh.reg; g_hoverIdx = hh.idx;
             InvalidateRect(h, nullptr, FALSE);
@@ -2113,7 +2186,10 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         Hit hh = HitTest(pt);
         switch (hh.reg) {
-        case R_CELL: LaunchLink(const_cast<Node*>(g_view[hh.idx]), false); break;
+        case R_CELL:                                      // 按住待判定：拖拽换位 或 松手单击启动
+            g_pressIdx = hh.idx; g_pressPt = pt;
+            SetCapture(h);
+            break;
         case R_BTN_CLOSE: HideWin(); break;
         case R_BTN_MENU: ShowMainMenu(); break;
         case R_BTN_PIN:
@@ -2132,6 +2208,21 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         return 0;
     }
+    case WM_LBUTTONUP: {
+        if (g_dragging) {                                 // 拖拽收尾：落盘新顺序
+            ReleaseCapture();
+            g_dragging = false;
+            SaveOrders();
+            InvalidateRect(h, nullptr, FALSE);
+        } else if (g_pressIdx >= 0 && g_pressIdx < (int)g_view.size()) {
+            LaunchLink(const_cast<Node*>(g_view[g_pressIdx]), false);   // 单击行为不变
+        }
+        g_pressIdx = -1;
+        return 0;
+    }
+    case WM_CAPTURECHANGED:                               // 捕获被打断（弹窗/失活）→ 丢弃本次按压
+        g_dragging = false; g_pressIdx = -1;
+        break;
     case WM_CONTEXTMENU: {
         if (!g_menuDone) { MenuCloseAll(); return 0; }   // 菜单展开时，首击只用于收起
         if ((HWND)w != h) break;
@@ -2165,6 +2256,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             size_t dot = nd.name.find_last_of(L'.');
             if (dot != std::wstring::npos && dot > 0) nd.name.resize(dot);   // 去扩展名，可再编辑
             nd.path = p;
+            nd.order = (int)g_nodes.size();
             g_nodes.push_back(nd); SaveNode(nd);
         }
         if (n) SaveNextId();
@@ -2261,6 +2353,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     g_hideOnFocus      = GetPrivateProfileIntW(L"behavior", L"hideOnFocus", 1, g_iniConf.c_str()) != 0;
     g_hideAfterLaunch  = GetPrivateProfileIntW(L"behavior", L"hideAfterLaunch", 1, g_iniConf.c_str()) != 0;
+    g_autoStart        = GetPrivateProfileIntW(L"behavior", L"autostart", 1, g_iniConf.c_str()) != 0;
     g_pinned           = GetPrivateProfileIntW(L"ui", L"pinned", 0, g_iniConf.c_str()) != 0;
     g_iconIdx          = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"iconSize", 1, g_iniConf.c_str())));
     g_sortMode         = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"sort", 0, g_iniConf.c_str())));
@@ -2356,6 +2449,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     if (!g_startHidden) ShowWin();
+    if (g_autoStart) ApplyAutoStart(true);   // 默认开：每次启动刷新 Run 路径，exe 挪位后自动跟上
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

@@ -117,6 +117,8 @@ x86_64-w64-mingw32-g++ -std=c++17 -O1 -municode -mwindows -DUNICODE -D_UNICODE \
 - 编辑/热键/监听三对话框自绘：`WS_POPUP` + `g_dlgBtns`/`g_dlgEdits` + `DrawDlgBtns`/`FindDlgBtn`，弹出居中主窗口，三对话框互斥（共享按钮数组）
 - 消息监听：标题栏第 4 枚按钮（播放，`g_rcBtns[3]`）= 纯启动/停止开关，反馈走托盘气泡（TrayTip，随机端口在气泡里告知）；设置（端口、来源 IP 前缀、弹窗停留秒数）在主菜单「监听设置…」，确定即保存、监听中自动重启生效；conf.ini `[listen]`（port 默认 22222、0=随机，allow=来源 IP 字面前缀白名单，逗号分隔，空=全放行，toast 默认 5 秒、0=不自动消失仅点击可关）；body 解析 `{"msg":"..."}`（宽松取值+转义，容忍 UTF-8 BOM）成功回 200 并 `PostMessage(WM_MSG)` → `ShowToast` 主显示器正中 TOPMOST 不抢焦点、按 toast 秒数自动淡出、点击即关；白名单拦截回 403（带来源 IP），格式错回 400（回显收到的 body），另有 Expect: 100-continue 应答；winsock2.h 必须在 windows.h 之前包含，链接加 ws2_32
 - 快捷键：仅键盘组合走 RegisterHotKey（conf.ini `[hot]` mod/vk）；鼠标触发方案与失焦自动隐藏冲突，已实现后又移除——勿再加回（conf.ini 遗留的 `[hot] mouse` 键直接忽略）
+- 开机自启：主菜单「开机自启」勾选项，默认开（conf.ini `[behavior] autostart`）；`ApplyAutoStart` 写/删 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 值 `windowTAG`（带引号的 exe 全路径），每次启动且开关为开时重写（exe 挪位自动跟上）；注册表 API 需 advapi32（build.bat 与 CI 链接行都已有）
+- 链接拖拽排序：网格单元格左键按下只 `SetCapture` 记 `g_pressIdx`，移动超 `S(6)` 才进拖拽（仅排序=添加顺序时生效，名称排序下保持纯单击语义）；`DragMove` 实时换位（`g_view` 与 `g_nodes` 同步 rotate，元素地址不变指针不失效），拖拽卡片描主色边；松手 `WM_LBUTTONUP` 未拖则按单击启动（单击行为不变），拖过则 `SaveOrders` 把 `Node.order` 重排落盘（links.ini `[node.X] order`，`LoadNodes` 按 order 稳定排序，旧文件缺省=读入序）；新建节点 order=`g_nodes.size()`；捕获被打断走 `WM_CAPTURECHANGED` 丢弃按压
 - 主窗口绘制在 `PaintAll`，布局在 `LayoutNow`（`g_rcTabs` 布局区），命中在 `HitTest`；`S()` 按 DPI 缩放所有尺寸；标签行右侧无加号（添加标签走主菜单）
 
 ### 协作习惯（用户本人）
