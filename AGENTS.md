@@ -116,7 +116,8 @@ x86_64-w64-mingw32-g++ -std=c++17 -O1 -municode -mwindows -DUNICODE -D_UNICODE \
 - Win11 观感走 DWM 属性（动态加载 dwmapi）：圆角 `DWMWCP_ROUND`、描边 `C_EDGE`、标题栏染天蓝兜底；Win10 自动跳过
 - 编辑/热键/监听三对话框自绘：`WS_POPUP` + `g_dlgBtns`/`g_dlgEdits` + `DrawDlgBtns`/`FindDlgBtn`，弹出居中主窗口，三对话框互斥（共享按钮数组）
 - 消息监听：标题栏第 4 枚按钮（播放，`g_rcBtns[3]`）= 纯启动/停止开关，反馈走托盘气泡（TrayTip，随机端口在气泡里告知）；设置（端口、来源 IP 前缀、弹窗停留秒数）在主菜单「监听设置…」，确定即保存、监听中自动重启生效；conf.ini `[listen]`（port 默认 22222、0=随机，allow=来源 IP 字面前缀白名单，逗号分隔，空=全放行，toast 默认 5 秒、0=不自动消失仅点击可关）；body 解析 `{"msg":"..."}`（宽松取值+转义，容忍 UTF-8 BOM）成功回 200 并 `PostMessage(WM_MSG)` → `ShowToast` 主显示器正中 TOPMOST 不抢焦点、按 toast 秒数自动淡出、点击即关；白名单拦截回 403（带来源 IP），格式错回 400（回显收到的 body），另有 Expect: 100-continue 应答；winsock2.h 必须在 windows.h 之前包含，链接加 ws2_32
-- 主窗口绘制在 `PaintAll`，布局在 `LayoutNow`（`g_rcTabs` 布局区），命中在 `HitTest`；`S()` 按 DPI 缩放所有尺寸
+- 快捷键：键盘组合走 RegisterHotKey（conf.ini `[hot]` mod/vk）；另支持鼠标触发（`[hot]` mouse：0=无 1=中键 2=中键双击 3=侧键后退 4=侧键前进），WH_MOUSE_LL 低级钩子只快速判断并 Post `WM_HOTMOUSE`、UI 动作在主循环做（钩子里耗时操作会卡全系统鼠标），本进程前台时不触发；入口在快捷键设置对话框「鼠标触发 ▸」行，点它向右侧展开菜单
+- 主窗口绘制在 `PaintAll`，布局在 `LayoutNow`（`g_rcTabs` 布局区），命中在 `HitTest`；`S()` 按 DPI 缩放所有尺寸；标签行右侧无加号（添加标签走主菜单）
 
 ### 协作习惯（用户本人）
 
