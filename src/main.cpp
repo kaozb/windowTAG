@@ -677,7 +677,7 @@ static void DrawDlgFace(HWND h, HDC dc) {
     }
     if (!IsRectEmpty(&g_rcDlgChk)) {                          // 管理员勾选框（仅链接编辑弹窗）
         RECT box = g_rcDlgChk; box.right = box.left + S(16);
-        box.top = box.bottom / 2 - S(8); box.bottom = box.top + S(16);
+        box.top = (g_rcDlgChk.top + g_rcDlgChk.bottom) / 2 - S(8); box.bottom = box.top + S(16);
         if (g_ctx.admin) {
             GdipFillRound(g, box, S(4), C_ACC, 255);
             DrawGlyph(dc, box, 0xE73E, C_ONTXT);              // CheckMark
