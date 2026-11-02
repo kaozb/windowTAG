@@ -44,6 +44,7 @@ enum { R_NONE = 0, R_TITLE, R_TAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN, R
 struct Node {
     int id = 0, type = 0, parent = 0;
     int order = 0;                        // 拖拽排序键（旧文件缺省 = 读入序）
+    int admin = 0;                        // 默认以管理员启动（仅链接；URL 忽略）
     std::wstring name, path, params;
 };
 
@@ -97,6 +98,7 @@ static RECT g_rcTitle, g_rcTag, g_rcGrid;
 static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
 static RECT g_rcBtns[4];             // 0=关闭 1=菜单 2=钉住 3=播放
 static RECT g_rcDlgX;                // 编辑对话框右上角关闭区
+static RECT g_rcDlgChk;              // 编辑对话框「以管理员启动」勾选区（非链接弹窗为空）
 struct DlgBtn { RECT rc; int id; const wchar_t* txt; bool primary; };
 static std::vector<DlgBtn> g_dlgBtns;
 static std::vector<RECT>   g_dlgEdits;
@@ -248,6 +250,7 @@ static void SaveNode(const Node& n) {
     WritePrivateProfileStringW(sec, L"name",   n.name.c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"path",   n.path.c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"params", n.params.c_str(), g_iniLinks.c_str());
+    WritePrivateProfileStringW(sec, L"admin",  std::to_wstring(n.admin).c_str(), g_iniLinks.c_str());
 }
 
 static void SaveNextId() {
@@ -302,6 +305,7 @@ static void LoadNodes() {
         GetPrivateProfileStringW(sec, L"name", L"", buf, 1024, g_iniLinks.c_str());   n.name = buf;
         GetPrivateProfileStringW(sec, L"path", L"", buf, 1024, g_iniLinks.c_str());   n.path = buf;
         GetPrivateProfileStringW(sec, L"params", L"", buf, 1024, g_iniLinks.c_str()); n.params = buf;
+        n.admin = GetPrivateProfileIntW(sec, L"admin", 0, g_iniLinks.c_str());
         g_nodes.push_back(n);
     }
     std::stable_sort(g_nodes.begin(), g_nodes.end(),
@@ -396,6 +400,8 @@ static HICON IconFor(const Node& n) {
 
 // ---------------- 启动链接 ----------------
 static void LaunchLink(Node* n, bool admin) {
+    if (admin && n->path.find(L"://") != std::wstring::npos)
+        admin = false;                                    // runas 对 URL 协议无效，忽略之
     SHELLEXECUTEINFOW sei = {};
     sei.cbSize = sizeof sei;
     sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_UNICODE;
@@ -601,6 +607,7 @@ static Hit HitTest(POINT p) {
 // ---------------- 编辑对话框 ----------------
 struct EditCtx {
     bool isNew = false; int type = NT_LINK, parent = 0, id = 0;
+    bool admin = false;
     std::wstring name, path, params;
 };
 static EditCtx g_ctx;
@@ -620,11 +627,13 @@ static void EditorApply() {
         Node n;
         n.id = g_nextId++; n.type = g_ctx.type; n.parent = g_ctx.parent;
         n.name = g_ctx.name; n.path = g_ctx.path; n.params = g_ctx.params;
+        n.admin = g_ctx.admin ? 1 : 0;
         n.order = (int)g_nodes.size();
         g_nodes.push_back(n); SaveNode(n); SaveNextId();
         if (n.type == NT_TAG) g_curTag = n.id;
     } else if (Node* n = Find(g_ctx.id)) {
         n->name = g_ctx.name; n->path = g_ctx.path; n->params = g_ctx.params;
+        n->admin = g_ctx.admin ? 1 : 0;
         SaveNode(*n);
     }
     Refresh();
@@ -666,6 +675,20 @@ static void DrawDlgFace(HWND h, HDC dc) {
         GdipFillRound(g, r, S(8), C_INSET, 255);
         GdipStrokeRound(g, r, S(8), C_SPLIT, 200, 1.0f);
     }
+    if (!IsRectEmpty(&g_rcDlgChk)) {                          // 管理员勾选框（仅链接编辑弹窗）
+        RECT box = g_rcDlgChk; box.right = box.left + S(16);
+        box.top = box.bottom / 2 - S(8); box.bottom = box.top + S(16);
+        if (g_ctx.admin) {
+            GdipFillRound(g, box, S(4), C_ACC, 255);
+            DrawGlyph(dc, box, 0xE73E, C_ONTXT);              // CheckMark
+        } else {
+            GdipFillRound(g, box, S(4), C_INSET, 255);
+            GdipStrokeRound(g, box, S(4), C_SPLIT, 200, 1.0f);
+        }
+        RECT tx = g_rcDlgChk; tx.left = box.right + S(8);
+        DrawTextRect(dc, tx, L"默认以管理员身份启动", g_fUi, C_TEXT,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
     DrawDlgBtns(dc);
     DrawGlyph(dc, g_rcDlgX, 0xE711, C_MUT);
 }
@@ -703,8 +726,10 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             btn(S(380) - x - S(72), S(88), S(72), IDC_BROWSE, L"浏览…", false);
             label(L"参数", x, S(130) + S(5));
             g_hParams = edit(x + lw, S(130), fw, g_ctx.params.c_str(), IDC_PARAMS);
-            by = S(170);
+            g_rcDlgChk = { x, S(170), x + S(170), S(170) + S(24) };
+            by = S(206);
         } else {
+            g_rcDlgChk = {};
             by = S(96);
         }
         btn(S(380) - x - S(88) * 2 - S(8), by, S(88), IDOK, L"确定", true);
@@ -739,6 +764,11 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         if (PtInRect(&g_rcDlgX, pt)) { DestroyWindow(h); return 0; }
+        if (!IsRectEmpty(&g_rcDlgChk) && PtInRect(&g_rcDlgChk, pt)) {
+            g_ctx.admin = !g_ctx.admin;
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         if (const DlgBtn* b = FindDlgBtn(pt)) {
             if (b->id == IDOK) EditorApply();
             else if (b->id == IDCANCEL) DestroyWindow(h);
@@ -764,7 +794,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SETCURSOR: {
         if (LOWORD(l) == HTCLIENT) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
-            bool hand = PtInRect(&g_rcDlgX, pt) || FindDlgBtn(pt);
+            bool hand = PtInRect(&g_rcDlgX, pt) || PtInRect(&g_rcDlgChk, pt) || FindDlgBtn(pt);
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
@@ -791,13 +821,14 @@ static void OpenEditor(int type, int parent, const Node* src) {
     if (src) {
         g_ctx.id = src->id; g_ctx.type = src->type; g_ctx.parent = src->parent;
         g_ctx.name = src->name; g_ctx.path = src->path; g_ctx.params = src->params;
+        g_ctx.admin = src->admin != 0;
     } else {
         g_ctx.type = type; g_ctx.parent = parent;
     }
     const wchar_t* title = g_ctx.isNew
         ? (type == NT_LINK ? L"添加链接" : L"添加标签")
         : L"编辑";
-    int cw = S(380), ch = (g_ctx.type == NT_LINK) ? S(210) : S(140);
+    int cw = S(380), ch = (g_ctx.type == NT_LINK) ? S(246) : S(140);
     RECT mr{};                                                  // 居中于主窗口
     if (g_hwnd) GetWindowRect(g_hwnd, &mr);
     int dx = mr.left + ((mr.right - mr.left) - cw) / 2;
@@ -1497,6 +1528,7 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_dlgBtns.push_back({ { S(300) - S(16) - S(88), S(128),
                                 S(300) - S(16), S(156) }, IDCANCEL, L"取消", false });
         g_rcDlgX = { S(300) - S(40), 0, S(300) - S(8), S(36) };
+        g_rcDlgChk = {};
         SetFocus(h);
         return 0;
     }
@@ -1949,6 +1981,7 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_dlgBtns.push_back({ { S(380) - x - S(88), S(204), S(380) - x, S(204) + S(28) },
                               IDCANCEL, L"取消", false });
         g_rcDlgX = { S(380) - S(40), 0, S(380) - S(8), S(36) };
+        g_rcDlgChk = {};
         return 0;
     }
     case WM_PAINT: {
@@ -2230,7 +2263,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             SaveOrders();
             InvalidateRect(h, nullptr, FALSE);
         } else if (g_pressIdx >= 0 && g_pressIdx < (int)g_view.size()) {
-            LaunchLink(const_cast<Node*>(g_view[g_pressIdx]), false);   // 单击行为不变
+            Node* n = const_cast<Node*>(g_view[g_pressIdx]);
+            LaunchLink(n, n->admin != 0);                 // 单击 = 默认方式（勾选管理员则提权）
         }
         g_pressIdx = -1;
         return 0;
