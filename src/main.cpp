@@ -1914,29 +1914,29 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
         gp::Graphics g(dc); GdipSetup(g);
-        // 饱和渐变底 + 白描边：纯白（浏览器）/纯黑桌面上都一眼可见
+        // 主题卡片：卡片底 + 描边 + 顶部主色细条（跟随应用深/浅主题）
         gp::GraphicsPath p;
         GdipPathRound(p, gp::RectF(0, 0, (FLOAT)rc.right, (FLOAT)rc.bottom), (FLOAT)S(14));
-        gp::LinearGradientBrush br(gp::PointF(0, 0),
-                                   gp::PointF((FLOAT)rc.right, (FLOAT)rc.bottom),
-                                   gp::Color(255, 70, 110, 225),
-                                   gp::Color(255, 168, 68, 205));
-        g.FillPath(&br, &p);
-        GdipStrokeRound(g, rc, S(14), C_WHITE, 210, 1.5f);
-        // 顶部小标签 + 底部操作提示
-        DrawGlyph(dc, { S(12), S(8), S(30), S(26) }, 0xE8BD, RGB(225, 232, 255));
-        DrawTextRect(dc, { S(32), S(8), rc.right - S(12), S(26) }, L"消息",
-                     g_fSmall, RGB(225, 232, 255), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        DrawTextRect(dc, { 0, rc.bottom - S(22), rc.right, rc.bottom - S(6) }, L"点击关闭",
-                     g_fSmall, RGB(220, 228, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        gp::SolidBrush body(Col(C_CARD, 255));
+        g.FillPath(&body, &p);
+        g.SetClip(&p);                                        // 细条裁进圆角内
+        gp::SolidBrush bar(Col(C_ACC, 255));
+        g.FillRectangle(&bar, 0, 0, rc.right, S(3));
+        g.ResetClip();
+        GdipStrokeRound(g, rc, S(14), C_EDGE, 255, 1.0f);
+        // 头部小标签 + 右上角 ✕（点击弹窗任意处即关）
+        DrawTextRect(dc, { S(20), S(10), rc.right - S(44), S(22) }, L"消息", g_fSmall, C_MUT,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawGlyph(dc, { rc.right - S(34), S(8), rc.right - S(10), S(28) }, 0xE711, C_MUT);
         std::wstring txt = g_msgText.empty() ? L"(空消息)" : g_msgText;
-        auto lines = WrapText(dc, txt, rc.right - S(36), 3);
-        int top = S(28);
-        int tot = (int)lines.size() * TextLineH();
-        int y = top + (rc.bottom - S(24) - top - tot) / 2;
+        auto lines = WrapText(dc, txt, rc.right - S(48), 5);
+        int lh = S(22);
+        int top = S(36), bottom = rc.bottom - S(16);
+        int tot = (int)lines.size() * lh;
+        int y = top + (bottom - top - tot) / 2;
         for (size_t i = 0; i < lines.size(); i++) {
-            RECT lr{ S(18), y + (int)i * TextLineH(), rc.right - S(18), y + (int)(i + 1) * TextLineH() };
-            DrawTextRect(dc, lr, lines[i].c_str(), g_fUiB, C_WHITE,
+            RECT lr{ S(24), y + (int)i * lh, rc.right - S(24), y + (int)(i + 1) * lh };
+            DrawTextRect(dc, lr, lines[i].c_str(), g_fTitle, C_TEXT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         EndPaint(h, &ps);
@@ -1950,7 +1950,7 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static void ShowToast(const std::wstring& text) {
-    int w = S(240), h = S(120);
+    int w = S(480), h = S(296);                            // 黄金比例 480:296，1080P 下屏宽 1/4
     if (!g_hToast) {
         WNDCLASSW tc = {};
         tc.lpfnWndProc = ToastProc;
