@@ -261,6 +261,18 @@ static void SaveNextId() {
     WritePrivateProfileStringW(L"meta", L"next", std::to_wstring(g_nextId).c_str(), g_iniLinks.c_str());
 }
 
+// ini 值存不了换行，片段命令的换行编为 \x01 落盘，展示/执行前还原
+static std::wstring EncNewl(const std::wstring& s) {
+    std::wstring r = s;
+    for (auto& ch : r) if (ch == L'\n') ch = L'\x01';
+    return r;
+}
+static std::wstring DecNewl(const std::wstring& s) {
+    std::wstring r = s;
+    for (auto& ch : r) if (ch == L'\x01') ch = L'\n';
+    return r;
+}
+
 static void DeleteNodeCascade(int id) {
     bool again = true;
     while (again) {
@@ -417,12 +429,13 @@ static void LaunchLink(Node* n, int mode) {               // 0=默认 1=管理�
     sei.hwnd = g_hwnd;
     std::wstring args, dir;
     if (n->type == NT_SNIPPET) {                          // 片段：CMD / PowerShell 执行整条命令
+        const std::wstring cmd = DecNewl(n->path);
         if (n->ps) {
             sei.lpFile = L"powershell.exe";
-            args = L"-NoProfile -ExecutionPolicy Bypass -Command " + n->path;
+            args = L"-NoProfile -ExecutionPolicy Bypass -Command " + cmd;
         } else {
             sei.lpFile = L"cmd.exe";
-            args = L"/c " + n->path;
+            args = L"/c " + cmd;
         }
         if (mode == 1) sei.lpVerb = L"runas";
         sei.lpParameters = args.c_str();
@@ -651,19 +664,24 @@ struct EditCtx {
 static EditCtx g_ctx;
 
 static void EditorApply() {
-    wchar_t buf[1024];
-    buf[0] = 0;
-    GetWindowTextW(g_hName, buf, 1024); g_ctx.name = buf;   // 片段弹窗无名称框，留空走自动命名
+    auto text = [](HWND c) {                                 // 多行片段命令可能超 1024 字符，按长度取
+        int n = GetWindowTextLengthW(c);
+        std::wstring s(n, L'\0');
+        if (n) GetWindowTextW(c, s.data(), n + 1);
+        return s;
+    };
+    g_ctx.name = text(g_hName);                              // 片段弹窗无名称框，留空走自动命名
     g_ctx.path.clear(); g_ctx.params.clear();
     if (g_ctx.type == NT_LINK) {
-        GetWindowTextW(g_hPath, buf, 1024); g_ctx.path = buf;
-        GetWindowTextW(g_hParams, buf, 1024); g_ctx.params = buf;
+        g_ctx.path = text(g_hPath);
+        g_ctx.params = text(g_hParams);
         if (g_ctx.path.empty()) { MessageBoxW(g_hDlg, L"请填写目标路径或网址。", L"启动器", MB_OK | MB_ICONWARNING); return; }
     } else if (g_ctx.type == NT_SNIPPET) {
-        GetWindowTextW(g_hPath, buf, 1024); g_ctx.path = buf;
+        g_ctx.path = text(g_hPath);
         if (g_ctx.path.empty()) { MessageBoxW(g_hDlg, L"请输入命令。", L"启动器", MB_OK | MB_ICONWARNING); return; }
         if (g_ctx.name.empty())                             // 名称留空：自动取命令首词
-            g_ctx.name = g_ctx.path.substr(0, g_ctx.path.find_first_of(L' '));
+            g_ctx.name = g_ctx.path.substr(0, g_ctx.path.find_first_of(L" \n"));
+        g_ctx.path = EncNewl(g_ctx.path);
     }
     if (g_ctx.name.empty()) { MessageBoxW(g_hDlg, L"请填写名称。", L"启动器", MB_OK | MB_ICONWARNING); return; }
 
@@ -757,10 +775,11 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
                             px, py, S(48), S(18), h, nullptr, inst, nullptr);
         };
-        auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id) -> HWND {
-            g_dlgEdits.push_back({ px, py, px + pw, py + S(28) });   // 外圈：父窗口画圆角底+描边
-            HWND c = CreateWindowExW(0, L"EDIT", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                     px + S(2), py + S(2), pw - S(4), S(28) - S(4),
+        auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id,
+                        int ph = S(28), DWORD es = ES_AUTOHSCROLL) -> HWND {
+            g_dlgEdits.push_back({ px, py, px + pw, py + ph });   // 外圈：父窗口画圆角底+描边
+            HWND c = CreateWindowExW(0, L"EDIT", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | es,
+                                     px + S(2), py + S(2), pw - S(4), ph - S(4),
                                      h, (HMENU)(INT_PTR)id, inst, nullptr);
             SendMessageW(c, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(8), S(8)));
             return c;
@@ -770,13 +789,14 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         };
         int x = S(16), lw = S(48), fw = S(380) - x * 2 - lw;
         int by;
-        if (type == NT_SNIPPET) {                             // 代码片段：仅一个命令输入框
+        if (type == NT_SNIPPET) {                             // 代码片段：多行命令文本域
             label(L"命令", x, S(46) + S(5));
-            g_hPath = edit(x + lw, S(46), fw, g_ctx.path.c_str(), IDC_PATH);
-            g_rcDlgChk = { x, S(88), x + S(170), S(88) + S(24) };   // 管理员
-            g_rcDlgCmd = { S(194), S(88), S(264), S(88) + S(24) };
-            g_rcDlgPs  = { S(272), S(88), S(364), S(88) + S(24) };
-            by = S(122);
+            g_hPath = edit(x + lw, S(46), fw, g_ctx.path.c_str(), IDC_PATH, S(112),
+                           ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL);
+            g_rcDlgChk = { x, S(170), x + S(170), S(170) + S(24) };   // 管理员
+            g_rcDlgCmd = { S(194), S(170), S(264), S(170) + S(24) };
+            g_rcDlgPs  = { S(272), S(170), S(364), S(170) + S(24) };
+            by = S(204);
         } else {
             label(L"名称", x, S(46) + S(5));
             g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
@@ -893,6 +913,7 @@ static void OpenEditor(int type, int parent, const Node* src) {
     if (src) {
         g_ctx.id = src->id; g_ctx.type = src->type; g_ctx.parent = src->parent;
         g_ctx.name = src->name; g_ctx.path = src->path; g_ctx.params = src->params;
+        if (src->type == NT_SNIPPET) g_ctx.path = DecNewl(src->path);   // 片段命令换行还原到编辑框
         g_ctx.admin = src->admin != 0;
         g_ctx.ps = src->ps != 0;
     } else {
@@ -902,7 +923,7 @@ static void OpenEditor(int type, int parent, const Node* src) {
         ? (type == NT_LINK ? L"添加链接" : type == NT_SNIPPET ? L"新建代码片段" : L"添加标签")
         : (type == NT_SNIPPET ? L"编辑代码片段" : L"编辑");
     int cw = S(380), ch = g_ctx.type == NT_LINK ? S(246)
-                  : g_ctx.type == NT_SNIPPET ? S(170) : S(140);
+                  : g_ctx.type == NT_SNIPPET ? S(248) : S(140);
     RECT mr{};                                                  // 居中于主窗口
     if (g_hwnd) GetWindowRect(g_hwnd, &mr);
     int dx = mr.left + ((mr.right - mr.left) - cw) / 2;
