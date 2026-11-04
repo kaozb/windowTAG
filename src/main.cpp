@@ -667,7 +667,7 @@ static void EditorApply() {
     auto text = [](HWND c) {                                 // 多行片段命令可能超 1024 字符，按长度取
         int n = GetWindowTextLengthW(c);
         std::wstring s(n, L'\0');
-        if (n) GetWindowTextW(c, s.data(), n + 1);
+        if (n) GetWindowTextW(c, &s[0], n + 1);
         return s;
     };
     g_ctx.name = text(g_hName);                              // 片段弹窗无名称框，留空走自动命名
