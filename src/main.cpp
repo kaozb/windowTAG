@@ -438,13 +438,24 @@ static void LaunchLink(Node* n, int mode) {               // 0=默认 1=管理�
         if (!n->params.empty()) args += L' ' + n->params;
         sei.lpParameters = args.c_str();
     } else {
-        sei.lpVerb = mode == 1 ? L"runas" : nullptr;
-        sei.lpFile = n->path.c_str();
-        if (!n->params.empty()) sei.lpParameters = n->params.c_str();
-        size_t sl = n->path.find_last_of(L'\\');          // 提权后 CWD 会变 System32，显式传文件所在目录
-        if (sl != std::wstring::npos) {
+        DWORD attr = GetFileAttributesW(n->path.c_str());
+        bool isDir = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+        bool isExe = n->path.size() > 4 && !_wcsicmp(n->path.c_str() + n->path.size() - 4, L".exe");
+        size_t sl = n->path.find_last_of(L'\\');
+        if (sl != std::wstring::npos) {               // 提权后 CWD 会变 System32，显式传文件所在目录
             dir = n->path.substr(0, sl + 1);
             sei.lpDirectory = dir.c_str();
+        }
+        if (mode == 1 && !isDir && !isExe) {          // 文档/lnk：runas 作用于文档常报无关联，借 start 走用户关联
+            sei.lpVerb = L"runas";
+            sei.lpFile = L"cmd.exe";
+            args = L"/c start \"\" \"" + n->path + L"\"";
+            if (!n->params.empty()) args += L' ' + n->params;
+            sei.lpParameters = args.c_str();
+        } else {
+            sei.lpVerb = mode == 1 ? L"runas" : nullptr;
+            sei.lpFile = n->path.c_str();
+            if (!n->params.empty()) sei.lpParameters = n->params.c_str();
         }
     }
     sei.nShow = SW_SHOWNORMAL;
