@@ -670,7 +670,7 @@ static void EditorApply() {
         if (n) GetWindowTextW(c, &s[0], n + 1);
         return s;
     };
-    g_ctx.name = text(g_hName);                              // 片段弹窗无名称框，留空走自动命名
+    g_ctx.name = text(g_hName);                              // 名称留空时片段自动取命令首词
     g_ctx.path.clear(); g_ctx.params.clear();
     if (g_ctx.type == NT_LINK) {
         g_ctx.path = text(g_hPath);
@@ -789,14 +789,16 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         };
         int x = S(16), lw = S(48), fw = S(380) - x * 2 - lw;
         int by;
-        if (type == NT_SNIPPET) {                             // 代码片段：多行命令文本域
-            label(L"命令", x, S(46) + S(5));
-            g_hPath = edit(x + lw, S(46), fw, g_ctx.path.c_str(), IDC_PATH, S(112),
+        if (type == NT_SNIPPET) {                             // 代码片段：名称 + 多行命令文本域
+            label(L"名称", x, S(46) + S(5));
+            g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
+            label(L"命令", x, S(88) + S(5));
+            g_hPath = edit(x + lw, S(88), fw, g_ctx.path.c_str(), IDC_PATH, S(112),
                            ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL);
-            g_rcDlgChk = { x, S(170), x + S(170), S(170) + S(24) };   // 管理员
-            g_rcDlgCmd = { S(194), S(170), S(264), S(170) + S(24) };
-            g_rcDlgPs  = { S(272), S(170), S(364), S(170) + S(24) };
-            by = S(204);
+            g_rcDlgChk = { x, S(212), x + S(170), S(212) + S(24) };   // 管理员
+            g_rcDlgCmd = { S(194), S(212), S(264), S(212) + S(24) };
+            g_rcDlgPs  = { S(272), S(212), S(364), S(212) + S(24) };
+            by = S(246);
         } else {
             label(L"名称", x, S(46) + S(5));
             g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
@@ -923,7 +925,7 @@ static void OpenEditor(int type, int parent, const Node* src) {
         ? (type == NT_LINK ? L"添加链接" : type == NT_SNIPPET ? L"新建代码片段" : L"添加标签")
         : (type == NT_SNIPPET ? L"编辑代码片段" : L"编辑");
     int cw = S(380), ch = g_ctx.type == NT_LINK ? S(246)
-                  : g_ctx.type == NT_SNIPPET ? S(248) : S(140);
+                  : g_ctx.type == NT_SNIPPET ? S(290) : S(140);
     RECT mr{};                                                  // 居中于主窗口
     if (g_hwnd) GetWindowRect(g_hwnd, &mr);
     int dx = mr.left + ((mr.right - mr.left) - cw) / 2;
