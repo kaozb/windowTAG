@@ -45,7 +45,7 @@ struct Node {
     int id = 0, type = 0, parent = 0;
     int order = 0;                        // 拖拽排序键（旧文件缺省 = 读入序）
     int admin = 0;                        // 默认以管理员启动（仅链接/片段；URL 忽略）
-    int ps = 0;                           // 片段专用：0=CMD 1=PowerShell
+    int ps = 0, cmd = 0;                  // 启动方式：cmd/ps 互斥，全 0=直接打开；片段必居其一
     std::wstring name, path, params;
 };
 
@@ -100,7 +100,7 @@ static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
 static RECT g_rcBtns[4];             // 0=关闭 1=菜单 2=钉住 3=播放
 static RECT g_rcDlgX;                // 编辑对话框右上角关闭区
 static RECT g_rcDlgChk;              // 编辑对话框「以管理员启动」勾选区（非链接/片段弹窗为空）
-static RECT g_rcDlgCmd;              // 片段弹窗「CMD」勾选区（其他弹窗为空）
+static RECT g_rcDlgCmd;              // 弹窗「CMD」勾选区（无 CMD/PS 勾选的弹窗为空）
 static RECT g_rcDlgPs;               // 片段弹窗「PowerShell」勾选区（其他弹窗为空）
 struct DlgBtn { RECT rc; int id; const wchar_t* txt; bool primary; };
 static std::vector<DlgBtn> g_dlgBtns;
@@ -255,6 +255,7 @@ static void SaveNode(const Node& n) {
     WritePrivateProfileStringW(sec, L"params", n.params.c_str(), g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"admin",  std::to_wstring(n.admin).c_str(), g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"ps",     std::to_wstring(n.ps).c_str(), g_iniLinks.c_str());
+    WritePrivateProfileStringW(sec, L"cmd",    std::to_wstring(n.cmd).c_str(), g_iniLinks.c_str());
 }
 
 static void SaveNextId() {
@@ -323,6 +324,7 @@ static void LoadNodes() {
         GetPrivateProfileStringW(sec, L"params", L"", buf, 1024, g_iniLinks.c_str()); n.params = buf;
         n.admin = GetPrivateProfileIntW(sec, L"admin", 0, g_iniLinks.c_str());
         n.ps    = GetPrivateProfileIntW(sec, L"ps", 0, g_iniLinks.c_str());
+        n.cmd   = GetPrivateProfileIntW(sec, L"cmd", 0, g_iniLinks.c_str());
         g_nodes.push_back(n);
     }
     std::stable_sort(g_nodes.begin(), g_nodes.end(),
@@ -448,7 +450,19 @@ static void LaunchLink(Node* n, int mode) {               // 0=默认 1=管理�
             dir = n->path.substr(0, sl + 1);
             sei.lpDirectory = dir.c_str();
         }
-        if (mode == 1 && !isDir && !isExe) {              // 文档/lnk：runas 直接提权常报无关联，借 start 走用户关联
+        if (n->ps && attr != INVALID_FILE_ATTRIBUTES) {       // 链接以 PowerShell 执行（-File，URL 无文件属性自动跳过）
+            sei.lpFile = L"powershell.exe";
+            args = L"-NoProfile -ExecutionPolicy Bypass -File \"" + n->path + L"\"";
+            if (!n->params.empty()) args += L' ' + n->params;
+            if (mode == 1) sei.lpVerb = L"runas";
+            sei.lpParameters = args.c_str();
+        } else if (n->cmd && attr != INVALID_FILE_ATTRIBUTES) {   // 链接借 cmd /c 执行
+            sei.lpFile = L"cmd.exe";
+            args = L"/c \"" + n->path + L"\"";
+            if (!n->params.empty()) args += L' ' + n->params;
+            if (mode == 1) sei.lpVerb = L"runas";
+            sei.lpParameters = args.c_str();
+        } else if (mode == 1 && !isDir && !isExe) {       // 文档/lnk：runas 直接提权常报无关联，借 start 走用户关联
             sei.lpVerb = L"runas";
             sei.lpFile = L"cmd.exe";
             args = L"/c start \"\" \"" + n->path + L"\"";
@@ -658,7 +672,7 @@ static Hit HitTest(POINT p) {
 // ---------------- 编辑对话框 ----------------
 struct EditCtx {
     bool isNew = false; int type = NT_LINK, parent = 0, id = 0;
-    bool admin = false, ps = false;
+    bool admin = false, ps = false, cmd = false;
     std::wstring name, path, params;
 };
 static EditCtx g_ctx;
@@ -691,6 +705,7 @@ static void EditorApply() {
         n.name = g_ctx.name; n.path = g_ctx.path; n.params = g_ctx.params;
         n.admin = g_ctx.admin ? 1 : 0;
         n.ps = g_ctx.ps ? 1 : 0;
+        n.cmd = g_ctx.cmd ? 1 : 0;
         n.order = (int)g_nodes.size();
         g_nodes.push_back(n); SaveNode(n); SaveNextId();
         if (n.type == NT_TAG) g_curTag = n.id;
@@ -698,6 +713,7 @@ static void EditorApply() {
         n->name = g_ctx.name; n->path = g_ctx.path; n->params = g_ctx.params;
         n->admin = g_ctx.admin ? 1 : 0;
         n->ps = g_ctx.ps ? 1 : 0;
+        n->cmd = g_ctx.cmd ? 1 : 0;
         SaveNode(*n);
     }
     Refresh();
@@ -755,7 +771,7 @@ static void DrawDlgFace(HWND h, HDC dc) {
                          DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         };
         if (!IsRectEmpty(&g_rcDlgChk)) chk(g_rcDlgChk, g_ctx.admin, L"以管理员身份启动");
-        if (!IsRectEmpty(&g_rcDlgCmd)) chk(g_rcDlgCmd, !g_ctx.ps, L"CMD");        // 片段互斥选择
+        if (!IsRectEmpty(&g_rcDlgCmd)) chk(g_rcDlgCmd, g_ctx.cmd, L"CMD");        // 与 PowerShell 互斥，全不勾=直接打开
         if (!IsRectEmpty(&g_rcDlgPs))  chk(g_rcDlgPs, g_ctx.ps, L"PowerShell");
     }
     DrawDlgBtns(dc);
@@ -808,7 +824,9 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 btn(S(380) - x - S(72), S(88), S(72), IDC_BROWSE, L"浏览…", false);
                 label(L"参数", x, S(130) + S(5));
                 g_hParams = edit(x + lw, S(130), fw, g_ctx.params.c_str(), IDC_PARAMS);
-                g_rcDlgChk = { x, S(170), x + S(170), S(170) + S(24) };
+                g_rcDlgChk = { x, S(170), x + S(170), S(170) + S(24) };   // 链接同样三勾选：管理员/CMD/PowerShell
+                g_rcDlgCmd = { S(194), S(170), S(264), S(170) + S(24) };
+                g_rcDlgPs  = { S(272), S(170), S(364), S(170) + S(24) };
                 by = S(206);
             } else {
                 by = S(96);
@@ -852,13 +870,15 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
-        if (!IsRectEmpty(&g_rcDlgCmd) && PtInRect(&g_rcDlgCmd, pt) && g_ctx.ps) {
-            g_ctx.ps = false;                             // 片段：CMD / PowerShell 互斥
+        if (!IsRectEmpty(&g_rcDlgCmd) && PtInRect(&g_rcDlgCmd, pt)) {
+            g_ctx.cmd = !g_ctx.cmd;                       // CMD / PowerShell 互斥
+            if (g_ctx.cmd) g_ctx.ps = false;
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
-        if (!IsRectEmpty(&g_rcDlgPs) && PtInRect(&g_rcDlgPs, pt) && !g_ctx.ps) {
-            g_ctx.ps = true;
+        if (!IsRectEmpty(&g_rcDlgPs) && PtInRect(&g_rcDlgPs, pt)) {
+            g_ctx.ps = !g_ctx.ps;
+            if (g_ctx.ps) g_ctx.cmd = false;
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
@@ -918,8 +938,10 @@ static void OpenEditor(int type, int parent, const Node* src) {
         if (src->type == NT_SNIPPET) g_ctx.path = DecNewl(src->path);   // 片段命令换行还原到编辑框
         g_ctx.admin = src->admin != 0;
         g_ctx.ps = src->ps != 0;
+        g_ctx.cmd = src->cmd != 0;
     } else {
         g_ctx.type = type; g_ctx.parent = parent;
+        if (type == NT_SNIPPET) g_ctx.cmd = true;             // 新建片段默认 CMD
     }
     const wchar_t* title = g_ctx.isNew
         ? (type == NT_LINK ? L"添加链接" : type == NT_SNIPPET ? L"新建代码片段" : L"添加标签")
