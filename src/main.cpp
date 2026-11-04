@@ -90,6 +90,7 @@ static int  g_hoverReg = R_NONE, g_hoverIdx = -1;
 static int  g_pressIdx = -1;            // 左键按下的网格单元：拖拽/单击共用起点
 static bool g_dragging = false;
 static POINT g_pressPt{};
+static POINT g_dragPt{};                // 拖拽中光标位置：浮起卡片绘制用
 
 static std::wstring g_iniConf, g_iniLinks;
 static NOTIFYICONDATAW g_nid = {};
@@ -1566,19 +1567,13 @@ static void PaintAll(HDC dc) {
         int saved = SaveDC(dc);
         IntersectClipRect(dc, inner.left, inner.top, inner.right, inner.bottom);
         gp::Graphics gc(dc); GdipSetup(gc);
-        for (int i = 0; i < (int)g_view.size(); i++) {
-            RECT r = CellRect(i);
-            if (r.bottom < inner.top || r.top > inner.bottom) continue;
-            bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i && !(g_dragging && g_pressIdx == i));
-            bool drag = (g_dragging && g_pressIdx == i);
-            GdipCard(gc, r, S(12), (hot || drag) ? C_HOVER : C_CARD);
-            if (drag) GdipStrokeRound(gc, r, S(12), C_ACC, 255, 2.0f);   // 拖拽中的卡片描主色边
-            HICON ic = IconFor(*g_view[i]);
+        auto drawCardBody = [&](const Node& nd, RECT r) {
+            HICON ic = IconFor(nd);
             int iy = r.top + S(12);
             if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, iy, ic,
                                isz, isz, 0, nullptr, DI_NORMAL);
             int ty = iy + isz + S(6);
-            auto lines = WrapText(dc, g_view[i]->name, CellW() - S(12), 2);
+            auto lines = WrapText(dc, nd.name, CellW() - S(12), 2);
             if (lines.size() == 1) ty += TextLineH() / 2;      // 单行时垂直居中，不贴顶
             for (size_t k = 0; k < lines.size(); k++) {
                 RECT lr{ r.left + S(6), ty + (int)k * TextLineH(),
@@ -1586,6 +1581,20 @@ static void PaintAll(HDC dc) {
                 DrawTextRect(dc, lr, lines[k].c_str(), g_fUi, C_TEXT,
                              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
+        };
+        for (int i = 0; i < (int)g_view.size(); i++) {
+            RECT r = CellRect(i);
+            if (r.bottom < inner.top || r.top > inner.bottom) continue;
+            if (g_dragging && i == g_pressIdx) continue;   // 被拖卡片原槽位留空：落点一目了然
+            GdipCard(gc, r, S(12), (g_hoverReg == R_CELL && g_hoverIdx == i) ? C_HOVER : C_CARD);
+            drawCardBody(*g_view[i], r);
+        }
+        if (g_dragging && g_pressIdx >= 0 && g_pressIdx < (int)g_view.size()) {
+            RECT gr{ g_dragPt.x - CellW() / 2, g_dragPt.y - CellH() / 2,    // 按住的那张浮起跟随光标
+                     g_dragPt.x - CellW() / 2 + CellW(), g_dragPt.y - CellH() / 2 + CellH() };
+            GdipCard(gc, gr, S(12), C_HOVER);
+            GdipStrokeRound(gc, gr, S(12), C_ACC, 255, 2.0f);   // 主色描边标明「拖的是这张」
+            drawCardBody(*g_view[g_pressIdx], gr);
         }
         RestoreDC(dc, saved);
     }
@@ -2309,6 +2318,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         Hit hh = HitTest(pt);
         if (g_pressIdx >= 0) {                            // 按住左键：先判定拖拽，松手未拖则按单击处理
             bool changed = false;
+            if (g_dragging) { g_dragPt = pt; changed = true; }   // 浮起卡片跟手，每帧重绘
             if (!g_dragging &&
                 (abs(pt.x - g_pressPt.x) > S(6) || abs(pt.y - g_pressPt.y) > S(6))) {
                 g_dragging = (g_sortMode == 0);           // 名称排序下拖不出可见效果，禁用拖拽
@@ -2360,7 +2370,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         Hit hh = HitTest(pt);
         switch (hh.reg) {
         case R_CELL:                                      // 按住待判定：拖拽换位 或 松手单击启动
-            g_pressIdx = hh.idx; g_pressPt = pt;
+            g_pressIdx = hh.idx; g_pressPt = pt; g_dragPt = pt;
             SetCapture(h);
             break;
         case R_BTN_CLOSE: HideWin(); break;
