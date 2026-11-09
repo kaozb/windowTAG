@@ -94,6 +94,8 @@ static int  g_sortMode = 0;             // 排序：0 添加顺序 / 1 名称升
 static std::vector<Clip> g_clips;       // 剪切板条目（单行文本）
 static int  g_nextClip = 1;
 static std::vector<const Clip*> g_clipView;
+static int    g_flashIdx  = -1;         // 刚复制的卡片：描边闪 1s + 底部「已复制」2s
+static DWORD  g_flashTick = 0;
 
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
 static bool g_autoStart = true;         // 开机自启（HKCU Run），默认开
@@ -484,6 +486,19 @@ static void CopyClipToClipboard(const std::wstring& s) {
     }
 }
 
+// 复制 + 就地反馈：卡片主色描边闪 1s（timer 2），底部提示临时变「已复制」2s（timer 3）
+static void CopyClipWithFlash(const Clip* c) {
+    if (!c) return;
+    CopyClipToClipboard(c->text);
+    g_flashIdx = -1;
+    for (int i = 0; i < (int)g_clipView.size(); i++)
+        if (g_clipView[i] == c) { g_flashIdx = i; break; }
+    g_flashTick = GetTickCount();
+    SetTimer(g_hwnd, 2, 1000, nullptr);
+    SetTimer(g_hwnd, 3, 2000, nullptr);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 // ---------------- 图标 ----------------
 static HICON IconFor(const Node& n) {
     auto it = g_icons.find(n.id);
@@ -633,9 +648,9 @@ static int CellW()  { static const int k[3] = { 92, 108, 128 }; return S(k[g_ico
 static int TextLineH() { return S(17); }
 static int CellH()  { return S(12) + IconPx() + S(6) + TextLineH() * 2 + S(12); }
 
-// 剪切板卡片：纯文本（最多 3 行），尺寸与图标大小设置无关
+// 剪切板卡片：纯文本（最多 3 行）+ 底部提示行，尺寸与图标大小设置无关
 static int ClipW()  { return S(150); }
-static int ClipH()  { return S(12) + TextLineH() * 3 + S(12); }
+static int ClipH()  { return S(12) + TextLineH() * 3 + S(4) + TextLineH() + S(8); }
 static bool InClipView() { return g_curTag == CLIP_TAG; }
 static int CellWNow() { return InClipView() ? ClipW() : CellW(); }
 static int CellHNow() { return InClipView() ? ClipH() : CellH(); }
@@ -1443,7 +1458,7 @@ static void ShowClipMenu(Clip* c, POINT scr) {
     MAdd(m, CL_EDIT, L"编辑");
     MAdd(m, CL_DEL, L"删除");
     switch (MPopup(std::move(m), scr)) {
-    case CL_COPY: CopyClipToClipboard(c->text); break;
+    case CL_COPY: CopyClipWithFlash(c); break;
     case CL_EDIT: OpenClipEditor(c); break;
     case CL_DEL:  DeleteClip(c->id); Refresh(); break;   // 直接删，不确认
     }
@@ -1659,8 +1674,9 @@ static void PaintAll(HDC dc) {
             if (r.bottom < inner.top || r.top > inner.bottom) continue;
             bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i && !(g_dragging && g_pressIdx == i));
             bool drag = (g_dragging && g_pressIdx == i);
+            bool flash = (i == g_flashIdx && GetTickCount() - g_flashTick < 1000);
             GdipCard(gc, r, S(10), (hot || drag) ? C_HOVER : C_CARD);
-            if (drag) GdipStrokeRound(gc, r, S(10), C_ACC, 255, 2.0f);
+            if (drag || flash) GdipStrokeRound(gc, r, S(10), C_ACC, 255, 2.0f);
             // hover 右上角小圆钮：删 / 编
             RECT bd, be; ClipBtnRects(r, bd, be);
             struct { RECT rc; int sub; wchar_t glyph; } btns[2] = {
@@ -1675,14 +1691,22 @@ static void PaintAll(HDC dc) {
                 }
             }
             auto lines = WrapText(dc, g_clipView[i]->text, ClipW() - S(20), 3);
+            int hintH = TextLineH() + S(4);                // 底部提示行（占位，文本不与其重叠）
             int tot = (int)lines.size() * TextLineH();
-            int ty = r.top + (ClipH() - tot) / 2;          // 行数不同也垂直居中
+            int ty = r.top + (ClipH() - hintH - tot) / 2;  // 行数不同也垂直居中
             for (size_t k = 0; k < lines.size(); k++) {
                 RECT lr{ r.left + S(10), ty + (int)k * TextLineH(),
                          r.right - S(10), ty + (int)(k + 1) * TextLineH() };
                 DrawTextRect(dc, lr, lines[k].c_str(), g_fUi, C_TEXT,
                              DT_LEFT | DT_VCENTER | DT_SINGLELINE);
             }
+            RECT hr{ r.left, r.bottom - TextLineH() - S(6), r.right, r.bottom - S(6) };
+            if (i == g_flashIdx && GetTickCount() - g_flashTick < 2000)
+                DrawTextRect(dc, hr, L"已复制", g_fSmall, C_ACC,
+                             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            else if (hot)
+                DrawTextRect(dc, hr, L"点击复制全文", g_fSmall, C_MUT,
+                             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         RECT ar = CellRect((int)g_clipView.size());        // 「＋」添加卡
         if (ar.bottom >= inner.top && ar.top <= inner.bottom) {
@@ -2539,7 +2563,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
         } else if (g_pressIdx >= 0 && g_pressIdx < ViewCount()) {
             if (InClipView()) {
-                CopyClipToClipboard(g_clipView[g_pressIdx]->text);   // 单击 = 复制全文
+                CopyClipWithFlash(g_clipView[g_pressIdx]);           // 单击 = 复制全文
             } else {
                 Node* n = const_cast<Node*>(g_view[g_pressIdx]);
                 LaunchLink(n, n->admin != 0);             // 单击 = 默认方式（勾选管理员则提权）
@@ -2600,6 +2624,16 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     case WM_TIMER:
+        if (w == 2) {                                     // 复制反馈：1s 到点，重绘去掉描边
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        if (w == 3) {                                     // 2s 到点：「已复制」恢复常态
+            g_flashIdx = -1;
+            KillTimer(h, 2); KillTimer(h, 3);
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         if (w == 1 && g_hideOnFocus && g_menuDone && IsWindowVisible(h) && !g_pinned && !g_hDlg && !g_hHK) {
             HWND fw = GetForegroundWindow();
             if (fw != h && (!fw || GetWindow(fw, GW_OWNER) != h)) HideWin();
