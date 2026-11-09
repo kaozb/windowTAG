@@ -38,14 +38,22 @@
 namespace gp = Gdiplus;
 
 // ---------------- 数据模型 ----------------
-enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2 };
-enum { R_NONE = 0, R_TITLE, R_TAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN, R_BTN_PLAY };
+enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2, CLIP_TYPE = 3 };
+enum { R_NONE = 0, R_TITLE, R_TAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN, R_BTN_PLAY,
+       R_CLIPBTN, R_CLIPADD };
+
+static const int CLIP_TAG = -1;       // g_curTag 特殊值：「剪切板」固定标签（标签行最右）
 
 struct Node {
     int id = 0, type = 0, parent = 0;
     int order = 0;                        // 拖拽排序键（旧文件缺省 = 读入序）
     int admin = 0;                        // 默认以管理员启动（仅链接；URL 忽略）
     std::wstring name, path, params;
+};
+
+struct Clip {                             // 剪切板条目：点击卡片 = 复制文本
+    int id = 0, order = 0;
+    std::wstring text;
 };
 
 // 菜单命令 ID
@@ -56,6 +64,7 @@ enum {
     M_THEME0 = 131, M_THEME1,                      // 主题 深色/浅色
     L_OPEN = 201, L_ADMIN, L_LOC, L_EDIT, L_DEL,
     T_ADDLINK = 301, T_REN, T_DEL,
+    CL_COPY = 401, CL_EDIT, CL_DEL, CL_ADD,        // 剪切板条目/空白菜单
     BG_ADDTAG = 501, BG_ADDLINK,
     TR_SHOW = 601, TR_EXIT
 };
@@ -75,22 +84,26 @@ static int       g_dpi = 96;
 
 static std::vector<Node> g_nodes;
 static int  g_nextId = 1;
-static int  g_curTag = 0;               // 节点 id；0 = "全部"
+static int  g_curTag = 0;               // 节点 id；0 = "全部"，-1 = 剪切板
 static std::vector<const Node*> g_view;
 static std::map<int, HICON> g_icons;
 static int  g_scroll = 0, g_cols = 4, g_maxScroll = 0;
 static int  g_iconIdx = 1;              // 图标大小：0 小 / 1 中 / 2 大
 static int  g_sortMode = 0;             // 排序：0 添加顺序 / 1 名称升序 / 2 名称降序
 
+static std::vector<Clip> g_clips;       // 剪切板条目（单行文本）
+static int  g_nextClip = 1;
+static std::vector<const Clip*> g_clipView;
+
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
 static bool g_autoStart = true;         // 开机自启（HKCU Run），默认开
 static bool g_tracking = false, g_startHidden = false;
-static int  g_hoverReg = R_NONE, g_hoverIdx = -1;
+static int  g_hoverReg = R_NONE, g_hoverIdx = -1, g_hoverSub = -1;
 static int  g_pressIdx = -1;            // 左键按下的网格单元：拖拽/单击共用起点
 static bool g_dragging = false;
 static POINT g_pressPt{};
 
-static std::wstring g_iniConf, g_iniLinks;
+static std::wstring g_iniConf, g_iniLinks, g_iniClips;
 static NOTIFYICONDATAW g_nid = {};
 
 // 布局区域
@@ -164,11 +177,13 @@ static bool EnableRoundedCorner(HWND, COLORREF);
 static void ApplyRoundRegion(HWND, bool);
 static void LaunchLink(Node* n, bool admin);
 static void OpenEditor(int type, int parent, const Node* src);
+static void OpenClipEditor(const Clip* src);
 static void HideWin();
 static void ShowMainMenu();
 static void OpenHotkeyDlg();
 static void OpenListenDlg();
 static void StopListener();
+static void ShowToast(const std::wstring& text);
 
 // ---------------- 基础工具 ----------------
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -320,18 +335,90 @@ static void SaveOrders() {
     }
 }
 
-// 把视图里 from 位置的链接实时移到 to 位置；g_nodes 与 g_view 同步换位（元素地址不变，指针不失效）
-static void DragMove(int from, int to) {
-    if (from < 0 || to < 0 || from >= (int)g_view.size() || to >= (int)g_view.size() || from == to) return;
-    Node* src = const_cast<Node*>(g_view[from]);
-    Node* dst = const_cast<Node*>(g_view[to]);
-    if (from < to) std::rotate(g_view.begin() + from, g_view.begin() + from + 1, g_view.begin() + to + 1);
-    else           std::rotate(g_view.begin() + to, g_view.begin() + from, g_view.begin() + from + 1);
-    auto si = std::find_if(g_nodes.begin(), g_nodes.end(), [&](const Node& n) { return &n == src; });
-    auto di = std::find_if(g_nodes.begin(), g_nodes.end(), [&](const Node& n) { return &n == dst; });
-    if (si == g_nodes.end() || di == g_nodes.end()) return;
+// ---------------- 剪切板数据 ----------------
+static Clip* FindClip(int id) {
+    for (auto& c : g_clips) if (c.id == id) return &c;
+    return nullptr;
+}
+
+static void SaveClip(const Clip& c) {
+    wchar_t sec[32]; wsprintfW(sec, L"clip.%d", c.id);
+    WritePrivateProfileStringW(sec, L"order", std::to_wstring(c.order).c_str(), g_iniClips.c_str());
+    WritePrivateProfileStringW(sec, L"text",  c.text.c_str(), g_iniClips.c_str());
+}
+
+static void SaveClipsNext() {
+    WritePrivateProfileStringW(L"meta", L"next", std::to_wstring(g_nextClip).c_str(), g_iniClips.c_str());
+}
+
+static void LoadClips() {
+    g_clips.clear();
+    g_nextClip = GetPrivateProfileIntW(L"meta", L"next", 1, g_iniClips.c_str());
+    wchar_t buf[2048];
+    for (int i = 1; i < g_nextClip; i++) {
+        wchar_t sec[32]; wsprintfW(sec, L"clip.%d", i);
+        GetPrivateProfileStringW(sec, L"text", L"\x1", buf, 2048, g_iniClips.c_str());
+        if (!wcscmp(buf, L"\x1")) continue;              // 节不存在 = 已删除
+        Clip c;
+        c.id = i;
+        c.order = GetPrivateProfileIntW(sec, L"order", i, g_iniClips.c_str());
+        c.text = buf;
+        g_clips.push_back(c);
+    }
+    std::stable_sort(g_clips.begin(), g_clips.end(),
+                     [](const Clip& a, const Clip& b) { return a.order < b.order; });
+}
+
+static void SaveClipOrders() {
+    for (int i = 0; i < (int)g_clips.size(); i++) {
+        if (g_clips[i].order != i) { g_clips[i].order = i; SaveClip(g_clips[i]); }
+    }
+}
+
+static void DeleteClip(int id) {
+    auto it = std::find_if(g_clips.begin(), g_clips.end(),
+                           [id](const Clip& c) { return c.id == id; });
+    if (it == g_clips.end()) return;
+    wchar_t sec[32]; wsprintfW(sec, L"clip.%d", id);
+    WritePrivateProfileStringW(sec, nullptr, nullptr, g_iniClips.c_str());
+    g_clips.erase(it);
+}
+
+// 把视图里 from 位置的条目实时移到 to 位置；存储与视图同步换位（元素地址不变，指针不失效）。
+// 链接与剪切板共用一套换位逻辑。
+template <class V, class S>
+static void DragMoveAny(int from, int to, V& view, S& store) {
+    if (from < 0 || to < 0 || from >= (int)view.size() || to >= (int)view.size() || from == to) return;
+    auto* src = view[from];
+    auto* dst = view[to];
+    if (from < to) std::rotate(view.begin() + from, view.begin() + from + 1, view.begin() + to + 1);
+    else           std::rotate(view.begin() + to, view.begin() + from, view.begin() + from + 1);
+    auto si = std::find_if(store.begin(), store.end(), [&](auto& n) { return &n == src; });
+    auto di = std::find_if(store.begin(), store.end(), [&](auto& n) { return &n == dst; });
+    if (si == store.end() || di == store.end()) return;
     if (si < di) std::rotate(si, si + 1, di + 1);
     else         std::rotate(di, si, si + 1);
+}
+
+// 把视图里 from 位置的链接实时移到 to 位置；g_nodes 与 g_view 同步换位（元素地址不变，指针不失效）
+static void DragMove(int from, int to) {
+    DragMoveAny(from, to, g_view, g_nodes);
+}
+
+static void DragMoveClip(int from, int to) {
+    DragMoveAny(from, to, g_clipView, g_clips);
+}
+
+// 按当前视图分流：拖拽换位
+static void DragMoveNow(int from, int to) {
+    if (g_curTag == CLIP_TAG) DragMoveClip(from, to);
+    else                      DragMove(from, to);
+}
+
+// 拖拽收尾：order 键重排落盘
+static void SaveOrdersNow() {
+    if (g_curTag == CLIP_TAG) SaveClipOrders();
+    else                      SaveOrders();
 }
 
 // ---------------- 视图 ----------------
@@ -357,9 +444,14 @@ static std::vector<Node*> TagList() {
     return v;
 }
 
-// 返回可挂链接的标签 id：优先当前标签，其次第一个标签；一个都没有就建"常用"
+static void RebuildClipView() {
+    g_clipView.clear();
+    for (auto& c : g_clips) g_clipView.push_back(&c);
+}
+
+// 返回可挂链接的标签 id：优先当前标签（剪切板视图除外），其次第一个标签；一个都没有就建"常用"
 static int EnsureCurTag() {
-    if (g_curTag) return g_curTag;
+    if (g_curTag && g_curTag != CLIP_TAG) return g_curTag;
     auto tl = TagList();
     if (!tl.empty()) return tl[0]->id;
     Node t; t.id = g_nextId++; t.type = NT_TAG; t.name = L"常用"; t.order = (int)g_nodes.size();
@@ -371,8 +463,27 @@ static int EnsureCurTag() {
 
 static void Refresh() {
     RebuildView();
+    RebuildClipView();
     LayoutNow();
     InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// ---------------- 剪贴板写入 ----------------
+static void CopyClipToClipboard(const std::wstring& s) {
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (s.size() + 1) * sizeof(wchar_t));
+    if (!h) return;
+    void* p = GlobalLock(h);
+    if (!p) { GlobalFree(h); return; }
+    memcpy(p, s.c_str(), (s.size() + 1) * sizeof(wchar_t));
+    GlobalUnlock(h);
+    if (OpenClipboard(g_hwnd)) {
+        EmptyClipboard();
+        SetClipboardData(CF_UNICODETEXT, h);            // 成功后所有权归系统
+        CloseClipboard();
+    } else {
+        GlobalFree(h);
+    }
+    ShowToast(L"已复制到剪贴板");
 }
 
 // ---------------- 图标 ----------------
@@ -524,6 +635,21 @@ static int CellW()  { static const int k[3] = { 92, 108, 128 }; return S(k[g_ico
 static int TextLineH() { return S(17); }
 static int CellH()  { return S(12) + IconPx() + S(6) + TextLineH() * 2 + S(12); }
 
+// 剪切板卡片：纯文本（最多 3 行），尺寸与图标大小设置无关
+static int ClipW()  { return S(150); }
+static int ClipH()  { return S(12) + TextLineH() * 3 + S(12); }
+static bool InClipView() { return g_curTag == CLIP_TAG; }
+static int CellWNow() { return InClipView() ? ClipW() : CellW(); }
+static int CellHNow() { return InClipView() ? ClipH() : CellH(); }
+static int ViewCount() { return InClipView() ? (int)g_clipView.size() : (int)g_view.size(); }
+
+// 剪切板卡片 hover 小钮：0=删除 1=编辑（右上角，两枚小圆）
+static void ClipBtnRects(const RECT& r, RECT& del, RECT& edit) {
+    int s = S(18);
+    edit = { r.right - s - S(5), r.top + S(5), r.right - S(5), r.top + S(5) + s };
+    del  = { edit.left - s - S(3), edit.top, edit.left - S(3), edit.bottom };
+}
+
 // 内容面板：卡片布局的唯一坐标基准（画板、卡片、滚动范围都从这里算，避免互相越界）
 static RECT PanelRect() {
     return { g_rcGrid.left + S(10), g_rcGrid.top + S(4),
@@ -543,7 +669,7 @@ static void LayoutNow() {
         g_rcBtns[i] = { x, (TitleH() - b) / 2, x + b, (TitleH() + b) / 2 };
     }
 
-    // 标签宽度按文本实测
+    // 标签宽度按文本实测；「剪切板」固定最右
     g_rcTabs.clear();
     HDC dc = GetDC(g_hwnd);
     HFONT of = (HFONT)SelectObject(dc, g_fUi);
@@ -557,15 +683,23 @@ static void LayoutNow() {
     };
     addTab(L"全部");
     for (auto* t : tl) addTab(t->name.c_str());
+    {
+        const wchar_t* cn = L"剪切板";
+        SIZE sz; GetTextExtentPoint32W(dc, cn, (int)wcslen(cn), &sz);
+        int cw = sz.cx + S(24) + S(18);                    // 文字 + 内边距 + 图标位
+        g_rcTabs.push_back({ g_rcTag.right - Gap() - cw, g_rcTag.top,
+                             g_rcTag.right - Gap(), g_rcTag.bottom });
+    }
     SelectObject(dc, of);
     ReleaseDC(g_hwnd, dc);
 
-    // 网格列数与滚动范围
+    // 网格列数与滚动范围（剪切板末尾多一张「＋」添加卡）
     RECT p = PanelRect();
     int avail = (p.right - p.left) - Gap() * 2;
-    g_cols = std::max(1, (avail + Gap()) / (CellW() + Gap()));
-    int rows = (int)((g_view.size() + g_cols - 1) / g_cols);
-    int content = rows * (CellH() + Gap()) + Gap();
+    g_cols = std::max(1, (avail + Gap()) / (CellWNow() + Gap()));
+    int n = ViewCount() + (InClipView() ? 1 : 0);
+    int rows = (int)((n + g_cols - 1) / g_cols);
+    int content = rows * (CellHNow() + Gap()) + Gap();
     g_maxScroll = std::max(0, content - (int)((p.bottom - p.top) - Gap()));
     g_scroll = std::min(g_scroll, g_maxScroll);
 }
@@ -573,12 +707,12 @@ static void LayoutNow() {
 static RECT CellRect(int i) {
     int col = i % g_cols, row = i / g_cols;
     RECT p = PanelRect();
-    int x = p.left + Gap() + col * (CellW() + Gap());
-    int y = p.top + Gap() + row * (CellH() + Gap()) - g_scroll;
-    return { x, y, x + CellW(), y + CellH() };
+    int x = p.left + Gap() + col * (CellWNow() + Gap());
+    int y = p.top + Gap() + row * (CellHNow() + Gap()) - g_scroll;
+    return { x, y, x + CellWNow(), y + CellHNow() };
 }
 
-struct Hit { int reg = R_NONE; int idx = -1; };
+struct Hit { int reg = R_NONE; int idx = -1, sub = -1; };
 
 static Hit HitTest(POINT p) {
     Hit h;
@@ -595,6 +729,21 @@ static Hit HitTest(POINT p) {
         return h;
     }
     if (PtInRect(&g_rcGrid, p)) {
+        if (InClipView()) {
+            int n = (int)g_clipView.size();
+            for (int i = 0; i < n; i++) {
+                RECT cr = CellRect(i);
+                if (!PtInRect(&cr, p)) continue;
+                RECT bd, be; ClipBtnRects(cr, bd, be);
+                if (PtInRect(&be, p)) { h.reg = R_CLIPBTN; h.idx = i; h.sub = 1; return h; }
+                if (PtInRect(&bd, p)) { h.reg = R_CLIPBTN; h.idx = i; h.sub = 0; return h; }
+                h.reg = R_CELL; h.idx = i;
+                return h;
+            }
+            RECT ar = CellRect(n);                         // 「＋」添加卡
+            if (PtInRect(&ar, p)) { h.reg = R_CLIPADD; return h; }
+            return h;
+        }
         int n = (int)g_view.size();
         for (int i = 0; i < n; i++) {
             RECT cr = CellRect(i);
@@ -608,6 +757,7 @@ static Hit HitTest(POINT p) {
 struct EditCtx {
     bool isNew = false; int type = NT_LINK, parent = 0, id = 0;
     bool admin = false;
+    int clipId = 0;                       // CLIP_TYPE：剪切板条目 id
     std::wstring name, path, params;
 };
 static EditCtx g_ctx;
@@ -615,6 +765,18 @@ static EditCtx g_ctx;
 static void EditorApply() {
     wchar_t buf[1024];
     GetWindowTextW(g_hName, buf, 1024); g_ctx.name = buf;
+    if (g_ctx.type == CLIP_TYPE) {                        // 剪切板：只存一段单行文本
+        if (g_ctx.name.empty()) { MessageBoxW(g_hDlg, L"请填写文本。", L"启动器", MB_OK | MB_ICONWARNING); return; }
+        if (g_ctx.isNew) {
+            Clip c; c.id = g_nextClip++; c.text = g_ctx.name; c.order = (int)g_clips.size();
+            g_clips.push_back(c); SaveClip(c); SaveClipsNext();
+        } else if (Clip* c = FindClip(g_ctx.clipId)) {
+            c->text = g_ctx.name; SaveClip(*c);
+        }
+        Refresh();
+        DestroyWindow(g_hDlg);
+        return;
+    }
     g_ctx.path.clear(); g_ctx.params.clear();
     if (g_ctx.type == NT_LINK) {
         GetWindowTextW(g_hPath, buf, 1024); g_ctx.path = buf;
@@ -717,7 +879,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_dlgBtns.push_back({ { px, py, px + pw, py + S(28) }, id, txt, pri });
         };
         int x = S(16), lw = S(48), fw = S(380) - x * 2 - lw;
-        label(L"名称", x, S(46) + S(5));
+        label(type == CLIP_TYPE ? L"文本" : L"名称", x, S(46) + S(5));
         g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
         int by;
         if (type == NT_LINK) {
@@ -812,6 +974,23 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
+// 居中于主窗口创建自绘对话框（编辑/剪切板文本共用）
+static void OpenDlgCentered(const wchar_t* title, int ch, int type) {
+    int cw = S(380);
+    RECT mr{};
+    if (g_hwnd) GetWindowRect(g_hwnd, &mr);
+    int dx = mr.left + ((mr.right - mr.left) - cw) / 2;
+    int dy = mr.top + ((mr.bottom - mr.top) - ch) / 2;
+    g_hDlg = CreateWindowExW(0, DLG_CLASS, title, WS_POPUP,
+                             dx, dy, cw, ch,
+                             g_hwnd, nullptr, g_hInst, (LPVOID)(INT_PTR)type);
+    if (g_hDlg) {
+        EnableRoundedCorner(g_hDlg, C_EDGE);
+        ApplyRoundRegion(g_hDlg, true);          // 无边框弹窗 DWM 不圆角，直接用区域兜底
+        FadeIn(g_hDlg, 120);
+    }
+}
+
 static void OpenEditor(int type, int parent, const Node* src) {
     if (g_hDlg) { SetForegroundWindow(g_hDlg); return; }
     if (g_hHK) DestroyWindow(g_hHK);       // 按钮数组全局共享，禁止对话框并发
@@ -828,19 +1007,19 @@ static void OpenEditor(int type, int parent, const Node* src) {
     const wchar_t* title = g_ctx.isNew
         ? (type == NT_LINK ? L"添加链接" : L"添加标签")
         : L"编辑";
-    int cw = S(380), ch = (g_ctx.type == NT_LINK) ? S(246) : S(140);
-    RECT mr{};                                                  // 居中于主窗口
-    if (g_hwnd) GetWindowRect(g_hwnd, &mr);
-    int dx = mr.left + ((mr.right - mr.left) - cw) / 2;
-    int dy = mr.top + ((mr.bottom - mr.top) - ch) / 2;
-    g_hDlg = CreateWindowExW(0, DLG_CLASS, title, WS_POPUP,
-                             dx, dy, cw, ch,
-                             g_hwnd, nullptr, g_hInst, (LPVOID)(INT_PTR)g_ctx.type);
-    if (g_hDlg) {
-        EnableRoundedCorner(g_hDlg, C_EDGE);
-        ApplyRoundRegion(g_hDlg, true);          // 无边框弹窗 DWM 不圆角，直接用区域兜底
-        FadeIn(g_hDlg, 120);
-    }
+    OpenDlgCentered(title, (g_ctx.type == NT_LINK) ? S(246) : S(140), g_ctx.type);
+}
+
+// 剪切板条目添加/编辑：与链接编辑共用 DLG_CLASS 自绘对话框，仅一个输入框
+static void OpenClipEditor(const Clip* src) {
+    if (g_hDlg) { SetForegroundWindow(g_hDlg); return; }
+    if (g_hHK) DestroyWindow(g_hHK);       // 按钮数组全局共享，禁止对话框并发
+    if (g_hLstn) DestroyWindow(g_hLstn);
+    g_ctx = EditCtx();
+    g_ctx.isNew = !src;
+    g_ctx.type = CLIP_TYPE;
+    if (src) { g_ctx.clipId = src->id; g_ctx.name = src->text; }
+    OpenDlgCentered(g_ctx.isNew ? L"添加剪切板文本" : L"编辑剪切板文本", S(140), CLIP_TYPE);
 }
 
 // ---------------- 自绘弹出菜单 ----------------
@@ -1245,11 +1424,30 @@ static void ShowTagMenu(Node* tag, POINT scr) {
 
 static void ShowGridBgMenu(POINT scr) {
     std::vector<MItem> m;
+    if (InClipView()) {                                   // 剪切板空白处：只提供添加
+        MAdd(m, CL_ADD, L"添加剪切板文本");
+        if (MPopup(std::move(m), scr) == CL_ADD) OpenClipEditor(nullptr);
+        return;
+    }
     MAdd(m, BG_ADDLINK, L"添加链接");
     MAdd(m, BG_ADDTAG, L"添加标签");
     switch (MPopup(std::move(m), scr)) {
     case BG_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
     case BG_ADDTAG:  OpenEditor(NT_TAG, 0, nullptr); break;
+    }
+}
+
+static void ShowClipMenu(Clip* c, POINT scr) {
+    if (!c) return;
+    std::vector<MItem> m;
+    MAdd(m, CL_COPY, L"复制");
+    MSep(m);
+    MAdd(m, CL_EDIT, L"编辑");
+    MAdd(m, CL_DEL, L"删除");
+    switch (MPopup(std::move(m), scr)) {
+    case CL_COPY: CopyClipToClipboard(c->text); break;
+    case CL_EDIT: OpenClipEditor(c); break;
+    case CL_DEL:  DeleteClip(c->id); Refresh(); break;   // 直接删，不确认
     }
 }
 
@@ -1416,24 +1614,91 @@ static void PaintAll(HDC dc) {
         DrawGlyph(dc, g_rcBtns[i], glyphs[i], c);
     }
 
-    // 标签栏：胶囊标签，选中=主色浮起
-    for (int i = 0; i < (int)g_rcTabs.size(); i++) {
-        bool sel = (i == 0) ? (g_curTag == 0)
-                            : (i - 1 < (int)tl.size() && tl[i - 1]->id == g_curTag);
-        bool hot = (g_hoverReg == R_TAG && g_hoverIdx == i);
-        const wchar_t* txt = (i == 0) ? L"全部" : tl[i - 1]->name.c_str();
-        FLOAT rad = (FLOAT)(g_rcTabs[i].bottom - g_rcTabs[i].top) / 2;
-        if (sel)      GdipCard(g, g_rcTabs[i], rad, C_ACC);
-        else if (hot) GdipCard(g, g_rcTabs[i], rad, C_CARD);
-        DrawTextRect(dc, g_rcTabs[i], txt, sel ? g_fUiB : g_fUi,
-                     sel ? C_ONTXT : (hot ? C_TEXT : C_MUT),
-                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    // 标签栏：胶囊标签，选中=主色浮起；末枚=「剪切板」固定标签（图标 + 细描边）
+    {
+        int nTabs = (int)g_rcTabs.size();
+        for (int i = 0; i < nTabs; i++) {
+            bool isClip = (i == nTabs - 1);
+            bool sel = isClip ? (g_curTag == CLIP_TAG)
+                              : (i == 0) ? (g_curTag == 0)
+                                         : (i - 1 < (int)tl.size() && tl[i - 1]->id == g_curTag);
+            bool hot = (g_hoverReg == R_TAG && g_hoverIdx == i);
+            const wchar_t* txt = isClip ? L"剪切板"
+                                         : (i == 0) ? L"全部" : tl[i - 1]->name.c_str();
+            FLOAT rad = (FLOAT)(g_rcTabs[i].bottom - g_rcTabs[i].top) / 2;
+            if (sel)      GdipCard(g, g_rcTabs[i], rad, C_ACC);
+            else if (hot) GdipCard(g, g_rcTabs[i], rad, C_CARD);
+            if (isClip && !sel && !hot)                       // 未选中：细描边与普通标签区分
+                GdipStrokeRound(g, g_rcTabs[i], rad, C_SPLIT, 90, 1.0f);
+            COLORREF tc = sel ? C_ONTXT : (hot ? C_TEXT : C_MUT);
+            HFONT tf = sel ? g_fUiB : g_fUi;
+            if (isClip) {                                     // 图标 + 文字整体居中
+                SIZE sz; GetTextExtentPoint32W(dc, txt, (int)wcslen(txt), &sz);
+                int total = S(14) + S(4) + sz.cx;
+                int cx = g_rcTabs[i].left + ((g_rcTabs[i].right - g_rcTabs[i].left) - total) / 2;
+                DrawGlyph(dc, { cx, g_rcTabs[i].top, cx + S(14), g_rcTabs[i].bottom },
+                          0xE8C8, tc);                        // Copy
+                RECT tr{ cx + S(18), g_rcTabs[i].top, g_rcTabs[i].right, g_rcTabs[i].bottom };
+                DrawTextRect(dc, tr, txt, tf, tc,
+                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            } else {
+                DrawTextRect(dc, g_rcTabs[i], txt, tf, tc,
+                             DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+        }
     }
 
     // 网格：轻拟物浮起卡片（裁剪到面板内，滚动时图标/文字不会溢出画板）
     RECT inner = panel;
     InflateRect(&inner, -S(2), -S(2));
-    if (g_view.empty()) {
+    if (InClipView()) {
+        // 剪切板视图：文本卡片（点卡片复制），末尾「＋」添加卡
+        int saved = SaveDC(dc);
+        IntersectClipRect(dc, inner.left, inner.top, inner.right, inner.bottom);
+        gp::Graphics gc(dc); GdipSetup(gc);
+        for (int i = 0; i < (int)g_clipView.size(); i++) {
+            RECT r = CellRect(i);
+            if (r.bottom < inner.top || r.top > inner.bottom) continue;
+            bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i && !(g_dragging && g_pressIdx == i));
+            bool drag = (g_dragging && g_pressIdx == i);
+            GdipCard(gc, r, S(10), (hot || drag) ? C_HOVER : C_CARD);
+            if (drag) GdipStrokeRound(gc, r, S(10), C_ACC, 255, 2.0f);
+            // hover 右上角小圆钮：删 / 编
+            RECT bd, be; ClipBtnRects(r, bd, be);
+            struct { RECT rc; int sub; wchar_t glyph; } btns[2] = {
+                { bd, 0, 0xE74D },                        // Delete
+                { be, 1, 0xE70F },                        // Edit
+            };
+            for (auto& b : btns) {
+                bool bh = (g_hoverReg == R_CLIPBTN && g_hoverIdx == i && g_hoverSub == b.sub);
+                if (hot || drag || bh) {
+                    GdipFillRound(gc, b.rc, S(9), bh && !drag ? C_ACC : C_INSET, 255);
+                    DrawGlyph(dc, b.rc, b.glyph, bh && !drag ? C_ONTXT : C_MUT);
+                }
+            }
+            auto lines = WrapText(dc, g_clipView[i]->text, ClipW() - S(20), 3);
+            int tot = (int)lines.size() * TextLineH();
+            int ty = r.top + (ClipH() - tot) / 2;          // 行数不同也垂直居中
+            for (size_t k = 0; k < lines.size(); k++) {
+                RECT lr{ r.left + S(10), ty + (int)k * TextLineH(),
+                         r.right - S(10), ty + (int)(k + 1) * TextLineH() };
+                DrawTextRect(dc, lr, lines[k].c_str(), g_fUi, C_TEXT,
+                             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            }
+        }
+        RECT ar = CellRect((int)g_clipView.size());        // 「＋」添加卡
+        if (ar.bottom >= inner.top && ar.top <= inner.bottom) {
+            bool hot = (g_hoverReg == R_CLIPADD);
+            GdipCard(gc, ar, S(10), hot ? C_HOVER : C_CARD);
+            DrawTextRect(dc, ar, L"＋", g_fUi, hot ? C_ACC : C_MUT,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        RestoreDC(dc, saved);
+        if (g_clipView.empty())
+            DrawTextRect(dc, { inner.left, inner.top, inner.right, inner.top + S(24) },
+                         L"添加常用文本，点击卡片即可复制", g_fUi, C_MUT,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else if (g_view.empty()) {
         const wchar_t* hint = g_curTag ? L"右键空白处添加链接，或直接拖入文件" : L"右键添加标签";
         DrawTextRect(dc, inner, hint, g_fUi, C_MUT, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
@@ -2186,37 +2451,38 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             bool changed = false;
             if (!g_dragging &&
                 (abs(pt.x - g_pressPt.x) > S(6) || abs(pt.y - g_pressPt.y) > S(6))) {
-                g_dragging = (g_sortMode == 0);           // 名称排序下拖不出可见效果，禁用拖拽
+                g_dragging = InClipView() || (g_sortMode == 0);   // 剪切板恒可拖；名称排序下链接拖不出可见效果，禁用拖拽
                 changed = g_dragging;
             }
             if (g_dragging && hh.reg == R_CELL && hh.idx != g_pressIdx) {
-                DragMove(g_pressIdx, hh.idx);             // 实时换位
+                DragMoveNow(g_pressIdx, hh.idx);          // 实时换位
                 g_pressIdx = hh.idx;
                 changed = true;
             }
             if (g_dragging && (g_hoverReg != R_CELL || g_hoverIdx != g_pressIdx)) {
-                g_hoverReg = R_CELL; g_hoverIdx = g_pressIdx;
+                g_hoverReg = R_CELL; g_hoverIdx = g_pressIdx; g_hoverSub = -1;
                 changed = true;
             }
             if (changed) InvalidateRect(h, nullptr, FALSE);   // 只在画面真变化时重绘，拖拽不空转 GPU/CPU
             break;
         }
-        if (hh.reg != g_hoverReg || hh.idx != g_hoverIdx) {
-            g_hoverReg = hh.reg; g_hoverIdx = hh.idx;
+        if (hh.reg != g_hoverReg || hh.idx != g_hoverIdx || hh.sub != g_hoverSub) {
+            g_hoverReg = hh.reg; g_hoverIdx = hh.idx; g_hoverSub = hh.sub;
             InvalidateRect(h, nullptr, FALSE);
         }
         break;
     }
     case WM_MOUSELEAVE:
         g_tracking = false;
-        g_hoverReg = R_NONE; g_hoverIdx = -1;
+        g_hoverReg = R_NONE; g_hoverIdx = -1; g_hoverSub = -1;
         InvalidateRect(h, nullptr, FALSE);
         break;
     case WM_SETCURSOR: {
         if (LOWORD(l) == HTCLIENT) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
             Hit hh = HitTest(pt);
-            bool hand = hh.reg == R_CELL || hh.reg == R_TAG ||
+            bool hand = hh.reg == R_CELL || hh.reg == R_TAG || hh.reg == R_CLIPBTN ||
+                        hh.reg == R_CLIPADD ||
                         (hh.reg >= R_BTN_CLOSE && hh.reg <= R_BTN_PLAY);
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
@@ -2234,9 +2500,19 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         Hit hh = HitTest(pt);
         switch (hh.reg) {
-        case R_CELL:                                      // 按住待判定：拖拽换位 或 松手单击启动
+        case R_CELL:                                      // 按住待判定：拖拽换位 或 松手单击
             g_pressIdx = hh.idx; g_pressPt = pt;
             SetCapture(h);
+            break;
+        case R_CLIPBTN: {                                 // 剪切板小钮：立即执行，不进拖拽
+            if (hh.idx < (int)g_clipView.size()) {
+                if (hh.sub == 1) OpenClipEditor(FindClip(g_clipView[hh.idx]->id));
+                else { DeleteClip(g_clipView[hh.idx]->id); Refresh(); }
+            }
+            break;
+        }
+        case R_CLIPADD:
+            OpenClipEditor(nullptr);
             break;
         case R_BTN_CLOSE: HideWin(); break;
         case R_BTN_MENU: ShowMainMenu(); break;
@@ -2251,6 +2527,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             auto tl = TagList();
             if (hh.idx == 0) SelectTag(0);
             else if (hh.idx - 1 < (int)tl.size()) SelectTag(tl[hh.idx - 1]->id);
+            else if (hh.idx == (int)g_rcTabs.size() - 1) SelectTag(CLIP_TAG);
             break;
         }
         }
@@ -2260,11 +2537,15 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (g_dragging) {                                 // 拖拽收尾：落盘新顺序
             ReleaseCapture();
             g_dragging = false;
-            SaveOrders();
+            SaveOrdersNow();
             InvalidateRect(h, nullptr, FALSE);
-        } else if (g_pressIdx >= 0 && g_pressIdx < (int)g_view.size()) {
-            Node* n = const_cast<Node*>(g_view[g_pressIdx]);
-            LaunchLink(n, n->admin != 0);                 // 单击 = 默认方式（勾选管理员则提权）
+        } else if (g_pressIdx >= 0 && g_pressIdx < ViewCount()) {
+            if (InClipView()) {
+                CopyClipToClipboard(g_clipView[g_pressIdx]->text);   // 单击 = 复制全文
+            } else {
+                Node* n = const_cast<Node*>(g_view[g_pressIdx]);
+                LaunchLink(n, n->admin != 0);             // 单击 = 默认方式（勾选管理员则提权）
+            }
         }
         g_pressIdx = -1;
         return 0;
@@ -2280,7 +2561,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         POINT pt = scr; ScreenToClient(h, &pt);
         Hit hh = HitTest(pt);
         switch (hh.reg) {
-        case R_CELL: ShowLinkMenu(const_cast<Node*>(g_view[hh.idx]), scr); break;
+        case R_CELL:
+            if (InClipView()) ShowClipMenu(FindClip(g_clipView[hh.idx]->id), scr);
+            else ShowLinkMenu(const_cast<Node*>(g_view[hh.idx]), scr);
+            break;
+        case R_CLIPBTN:
+            if (hh.idx < (int)g_clipView.size())
+                ShowClipMenu(FindClip(g_clipView[hh.idx]->id), scr);
+            break;
         case R_TAG: {
             auto tl = TagList();
             if (hh.idx >= 1 && hh.idx - 1 < (int)tl.size()) ShowTagMenu(tl[hh.idx - 1], scr);
@@ -2389,10 +2677,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
 
     std::wstring dir = ExeDir();
     g_iniConf  = dir + L"conf.ini";
-    CreateDirectoryW((dir + L"data").c_str(), nullptr);   // 目录缺失时 links.ini 所有写入会静默失败
+    CreateDirectoryW((dir + L"data").c_str(), nullptr);   // 目录缺失时 ini 所有写入会静默失败
     g_iniLinks = dir + L"data\\links.ini";
+    g_iniClips = dir + L"data\\clips.ini";
     EnsureUnicodeIni(g_iniConf);
     EnsureUnicodeIni(g_iniLinks);
+    EnsureUnicodeIni(g_iniClips);
 
     if (already) {
         HWND h = FindWindowW(MAIN_CLASS, nullptr);
@@ -2425,8 +2715,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     int wh = std::max(S(340), (int)GetPrivateProfileIntW(L"ui", L"h", S(460), g_iniConf.c_str()));
 
     LoadNodes();
+    LoadClips();
     g_curTag = GetPrivateProfileIntW(L"ui", L"curTag", 0, g_iniConf.c_str());   // 记住上次选中标签
-    if (g_curTag) {
+    if (g_curTag == CLIP_TAG) {
+        // 剪切板固定标签，直接保留
+    } else if (g_curTag) {
         bool ok = false;
         for (auto& n : g_nodes) if (n.type == NT_TAG && n.id == g_curTag) ok = true;
         if (!ok) g_curTag = 0;                                  // 标签已被删除则回落"全部"
