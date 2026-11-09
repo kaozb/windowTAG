@@ -183,7 +183,6 @@ static void ShowMainMenu();
 static void OpenHotkeyDlg();
 static void OpenListenDlg();
 static void StopListener();
-static void ShowToast(const std::wstring& text);
 
 // ---------------- 基础工具 ----------------
 static int S(int v) { return MulDiv(v, g_dpi, 96); }
@@ -483,7 +482,6 @@ static void CopyClipToClipboard(const std::wstring& s) {
     } else {
         GlobalFree(h);
     }
-    ShowToast(L"已复制到剪贴板");
 }
 
 // ---------------- 图标 ----------------
