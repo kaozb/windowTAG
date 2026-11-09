@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>剪切板面板 · 交互示意图</title>
+<style>
+  /* ===== 配色取自 ApplyTheme()：语义槽位一一对应 ===== */
+  :root{
+    --bg:#202020; --card:#3b3b3b; --hover:#454545; --inset:#2b2b2b;
+    --text:#ffffff; --mut:#929292; --split:#6b6b6b; --edge:#242424;
+    --menu:#4a4a4a; --menuh:#616161;
+    --acc:#7896b4; --ontxt:#1c2026;
+    --shadow:rgba(0,0,0,.5); --mask:rgba(0,0,0,.55);
+  }
+  body.light{
+    --bg:#ededed; --card:#ffffff; --hover:#eef4fa; --inset:#f3f3f3;
+    --text:#222222; --mut:#7c7c7c; --split:#d4d4d4; --edge:#c6c6c6;
+    --menu:#ffffff; --menuh:#eef4fa;
+    --shadow:rgba(70,70,70,.35); --mask:rgba(0,0,0,.25);
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-font-smoothing:antialiased;}
+  body{
+    min-height:100vh; background:#141414; display:flex; flex-direction:column;
+    align-items:center; padding:28px 16px 40px; gap:14px;
+    font-family:"Microsoft YaHei UI","Microsoft YaHei","PingFang SC",sans-serif;
+    transition:background .25s;
+  }
+  body.light{background:#c9c9c9;}
+
+  /* ===== 页面工具条（非应用部分） ===== */
+  .pagebar{width:780px;max-width:100%;display:flex;align-items:center;justify-content:space-between;}
+  .pagebar h1{font-size:15px;font-weight:600;color:#ddd;}
+  body.light .pagebar h1{color:#333;}
+  .theme-sw{display:flex;gap:6px;}
+  .theme-sw button{
+    font:12px/1 inherit;padding:6px 12px;border-radius:12px;border:1px solid transparent;
+    cursor:pointer;color:#aaa;background:#2a2a2a;
+  }
+  .theme-sw button.on{color:#1c2026;background:#7896b4;font-weight:600;}
+
+  /* ===== 应用窗口 ===== */
+  .win{
+    width:780px;max-width:100%;height:520px;background:var(--bg);color:var(--text);
+    border:1px solid var(--edge);border-radius:10px;box-shadow:0 18px 50px var(--shadow);
+    display:flex;flex-direction:column;overflow:hidden;position:relative;
+    transition:background .25s,color .25s;
+  }
+
+  /* --- 标题栏：左=应用名，右=日期+播放/钉住/菜单/关闭 --- */
+  .titlebar{height:38px;flex:none;display:flex;align-items:center;padding:0 10px 0 14px;}
+  .titlebar .app{font-size:13px;font-weight:700;}
+  .titlebar .date{margin-left:auto;font-size:12px;color:var(--mut);margin-right:8px;}
+  .tbtn{
+    width:30px;height:30px;border-radius:9px;border:none;background:transparent;
+    color:var(--mut);display:flex;align-items:center;justify-content:center;
+    cursor:default;margin-left:2px;flex:none;
+  }
+  .tbtn svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:1.4;
+    stroke-linecap:round;stroke-linejoin:round;}
+  .tbtn:hover{background:var(--card);color:var(--text);box-shadow:inset 0 0 0 1px var(--split);}
+
+  /* --- 标签行：普通标签靠左，「剪切板」固定最右 --- */
+  .tagbar{height:34px;flex:none;display:flex;align-items:center;padding:0 10px 0 8px;gap:6px;}
+  .tab{
+    height:26px;padding:0 13px;border-radius:13px;font-size:12.5px;color:var(--mut);
+    display:flex;align-items:center;gap:6px;cursor:pointer;user-select:none;white-space:nowrap;
+  }
+  .tab:hover{background:var(--card);color:var(--text);}
+  .tab.sel{background:var(--acc);color:var(--ontxt);font-weight:600;}
+  .tab svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.5;
+    stroke-linecap:round;stroke-linejoin:round;}
+  .tab.clip{margin-left:auto;}          /* ← 核心：固定在标签行最右端 */
+  .tab.clip:not(.sel){box-shadow:inset 0 0 0 1px var(--split);}   /* 与普通标签区分的细描边 */
+
+  /* --- 内容面板 --- */
+  .panel{flex:1;margin:2px 10px 10px;overflow:hidden auto;scrollbar-width:thin;
+    scrollbar-color:var(--split) transparent;}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(156px,1fr));gap:8px;}
+
+  /* 链接卡片（现有样式，仅示意对照） */
+  .linkcard{
+    background:var(--card);border-radius:12px;padding:12px 6px 10px;
+    display:flex;flex-direction:column;align-items:center;gap:6px;cursor:pointer;
+  }
+  .linkcard:hover{background:var(--hover);}
+  .lico{width:40px;height:40px;border-radius:10px;display:flex;align-items:center;justify-content:center;}
+  .lico svg{width:22px;height:22px;fill:none;stroke:#fff;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
+  .linkcard .t{font-size:12px;line-height:17px;height:34px;display:flex;align-items:center;
+    text-align:center;color:var(--text);}
+
+  /* 剪切板文本卡片：点卡片主体=复制 */
+  .clipcard{
+    position:relative;background:var(--card);border-radius:12px;padding:12px 12px 10px;
+    height:96px;cursor:pointer;border:1.5px solid transparent;
+    display:flex;flex-direction:column;justify-content:center;
+    transition:background .12s,border-color .12s,transform .12s;
+  }
+  .clipcard:hover{background:var(--hover);transform:translateY(-2px);}
+  .clipcard .txt{
+    font-size:12.5px;line-height:19px;color:var(--text);word-break:break-all;
+    display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;
+  }
+  .clipcard .hint{
+    position:absolute;left:12px;bottom:7px;font-size:10.5px;color:var(--mut);
+    opacity:0;transition:opacity .12s;display:flex;align-items:center;gap:4px;
+  }
+  .clipcard .hint svg{width:10px;height:10px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;}
+  .clipcard:hover .hint{opacity:.8;}
+  .clipcard.copied{border-color:var(--acc);}
+  .clipcard.copied .txt{color:var(--acc);}
+  /* hover 右上角小圆钮：编辑 / 删除（点这里不触发复制） */
+  .mini{
+    position:absolute;top:7px;width:22px;height:22px;border-radius:11px;border:none;
+    background:var(--inset);color:var(--mut);display:flex;align-items:center;justify-content:center;
+    cursor:pointer;opacity:0;transition:opacity .12s,background .12s,color .12s;
+  }
+  .clipcard:hover .mini{opacity:1;}
+  .mini:hover{background:var(--acc);color:var(--ontxt);}
+  .mini.edit{right:7px;}
+  .mini.del{right:33px;}
+  .mini svg{width:11px;height:11px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round;}
+
+  /* 添加卡片 */
+  .addcard{
+    height:96px;border-radius:12px;background:var(--card);cursor:pointer;
+    display:flex;align-items:center;justify-content:center;color:var(--mut);
+    font-size:26px;font-weight:300;transition:background .12s,color .12s;
+  }
+  .addcard:hover{background:var(--hover);color:var(--acc);}
+
+  .empty{height:100%;display:flex;align-items:center;justify-content:center;
+    color:var(--mut);font-size:13px;}
+
+  /* --- 复制成功 toast（对应应用 ShowToast 的中央提示） --- */
+  .toast{
+    position:absolute;left:50%;top:46%;transform:translate(-50%,-50%) scale(.92);
+    background:var(--menu);color:var(--text);border:1px solid var(--split);
+    padding:9px 18px;border-radius:10px;font-size:13px;display:flex;align-items:center;gap:8px;
+    box-shadow:0 10px 30px var(--shadow);opacity:0;pointer-events:none;
+    transition:opacity .18s,transform .18s;z-index:30;
+  }
+  .toast.show{opacity:1;transform:translate(-50%,-50%) scale(1);}
+  .toast svg{width:14px;height:14px;fill:none;stroke:var(--acc);stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round;}
+
+  /* --- 自绘风格菜单（右键） --- */
+  .ctx{
+    position:absolute;z-index:40;min-width:118px;background:var(--menu);
+    border:1px solid var(--split);border-radius:10px;padding:4px;
+    box-shadow:0 12px 32px var(--shadow);display:none;
+  }
+  .ctx.open{display:block;}
+  .ctx button{
+    display:flex;width:100%;align-items:center;gap:9px;border:none;background:transparent;
+    color:var(--text);font-size:12.5px;padding:8px 12px;border-radius:7px;cursor:pointer;text-align:left;
+  }
+  .ctx button:hover{background:var(--menuh);}
+  .ctx button.danger:hover{color:#e07b7b;}
+  .ctx svg{width:13px;height:13px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;}
+
+  /* --- 添加/编辑对话框（贴应用自绘对话框风格） --- */
+  .mask{position:fixed;inset:0;background:var(--mask);z-index:50;display:none;
+    align-items:center;justify-content:center;}
+  .mask.open{display:flex;}
+  .dlg{
+    width:340px;background:var(--card);border:1px solid var(--split);border-radius:12px;
+    box-shadow:0 24px 60px var(--shadow);padding:16px 16px 14px;position:relative;
+  }
+  .dlg h3{font-size:13.5px;margin-bottom:12px;}
+  .dlg .x{position:absolute;top:8px;right:8px;width:26px;height:26px;border:none;border-radius:8px;
+    background:transparent;color:var(--mut);cursor:pointer;font-size:13px;}
+  .dlg .x:hover{background:var(--hover);color:var(--text);}
+  .dlg textarea{
+    width:100%;height:84px;resize:none;border:none;outline:none;border-radius:8px;
+    background:var(--inset);color:var(--text);font:12.5px/1.6 inherit;padding:9px 10px;
+  }
+  .dlg textarea:focus{box-shadow:inset 0 0 0 1.5px var(--acc);}
+  .dlg .row{display:flex;justify-content:flex-end;gap:8px;margin-top:13px;}
+  .dlg .row button{
+    height:30px;padding:0 18px;border-radius:15px;border:none;font-size:12.5px;cursor:pointer;
+  }
+  .dlg .cancel{background:var(--inset);color:var(--mut);}
+  .dlg .cancel:hover{background:var(--hover);color:var(--text);}
+  .dlg .ok{background:var(--acc);color:var(--ontxt);font-weight:600;}
+  .dlg .ok:hover{filter:brightness(1.08);}
+
+  /* ===== 页脚设计说明（非应用部分） ===== */
+  .notes{width:780px;max-width:100%;color:#8a8a8a;font-size:12px;line-height:1.9;
+    background:#1b1b1b;border:1px solid #2c2c2c;border-radius:10px;padding:12px 16px;}
+  body.light .notes{background:#f6f6f6;border-color:#d8d8d8;color:#555;}
+  .notes b{color:#bbb;}
+  body.light .notes b{color:#333;}
+</style>
+</head>
+<body>
+
+<div class="pagebar">
+  <h1>「剪切板」面板 · 交互示意图</h1>
+  <div class="theme-sw">
+    <button id="thDark" class="on">深色</button>
+    <button id="thLight">浅色</button>
+  </div>
+</div>
+
+<div class="win" id="win">
+  <!-- 标题栏 -->
+  <div class="titlebar">
+    <span class="app">启动面板</span>
+    <span class="date">11月9日</span>
+    <button class="tbtn" title="监听"><svg viewBox="0 0 16 16"><path d="M4 2.5 12.5 8 4 13.5z"/></svg></button>
+    <button class="tbtn" title="钉住"><svg viewBox="0 0 16 16"><path d="M9.5 1.5 14.5 6.5 12 7l-3 3 .5 3.5-1.5 1.5L4.5 11.5 1.5 14.5l1-1 2.5-2.5L1.5 7.5 3 6l3.5.5 3-3z"/></svg></button>
+    <button class="tbtn" title="菜单"><svg viewBox="0 0 16 16"><path d="M2.5 4.5h11M2.5 8h11M2.5 11.5h11"/></svg></button>
+    <button class="tbtn" title="关闭"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+  </div>
+
+  <!-- 标签行：普通标签靠左，「剪切板」固定最右 -->
+  <div class="tagbar">
+    <div class="tab sel" data-view="all">全部</div>
+    <div class="tab" data-view="work">工作</div>
+    <div class="tab" data-view="tools">工具</div>
+    <div class="tab clip" data-view="clip" id="tabClip">
+      <svg viewBox="0 0 16 16"><rect x="4" y="3" width="8" height="11" rx="1.5"/><path d="M6.5 3V2h3v1"/><path d="M6 7h4M6 9.5h4M6 12h2.5"/></svg>
+      剪切板
+    </div>
+  </div>
+
+  <!-- 内容区 -->
+  <div class="panel">
+    <div class="grid" id="grid"></div>
+  </div>
+
+  <div class="toast" id="toast">
+    <svg viewBox="0 0 16 16"><path d="M3 8.5 6.5 12 13 4.5"/></svg>
+    <span id="toastTxt">已复制到剪贴板</span>
+  </div>
+
+  <div class="ctx" id="ctx">
+    <button data-act="copy"><svg viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>复制</button>
+    <button data-act="edit"><svg viewBox="0 0 16 16"><path d="M11.5 2.5 13.5 4.5 5.5 12.5 3 13l.5-2.5z"/></svg>编辑</button>
+    <button data-act="del" class="danger"><svg viewBox="0 0 16 16"><path d="M3 4.5h10M6.5 4.5v-1h3v1M4.5 4.5 5 13h6l.5-8.5"/></svg>删除</button>
+  </div>
+</div>
+
+<!-- 添加 / 编辑对话框 -->
+<div class="mask" id="mask">
+  <div class="dlg">
+    <button class="x" id="dlgX">✕</button>
+    <h3 id="dlgTitle">添加剪切板文本</h3>
+    <textarea id="dlgText" placeholder="输入要保存的文本，点击卡片即可复制…"></textarea>
+    <div class="row">
+      <button class="cancel" id="dlgCancel">取消</button>
+      <button class="ok" id="dlgOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<div class="notes">
+  <b>设计要点</b>（对应窗口TAG现有视觉，未引入新语言）：<br>
+  1. <b>「剪切板」胶囊固定在标签行最右端</b>，不随普通标签增删移动；未选中时带细描边 + 剪贴板小图标，与普通标签区分。<br>
+  2. <b>点卡片主体 = 复制全文到系统剪贴板</b>，反馈：卡片闪主色描边 + 中央「已复制」提示（复用应用现有 toast 机制）；hover 底部显示全文前缀。<br>
+  3. <b>hover 右上角浮出两个小圆钮：编辑 / 删除</b>，点小钮不触发复制；也可以右键卡片走菜单（复制/编辑/删除）。<br>
+  4. <b>末尾「+」卡片添加</b>，与编辑共用一个对话框（贴现有自绘对话框风格）；数据存 exe 旁 data/ 下 ini，启动读回。<br>
+  5. 示例文本可在下面试着点：复制是真实生效的，可直接去别处粘贴验证。
+</div>
+
+<script>
+  /* ---------- 数据（示意） ---------- */
+  let clips = [
+    {id:1, text:'会议链接 https://meet.example.com/team/weekly-123456'},
+    {id:2, text:'收件地址：北京市海淀区中关村大街1号 鼎好大厦 A 座 808（张三收 138-0011-2233）'},
+    {id:3, text:'git push origin main --force-with-lease'},
+    {id:4, text:'您好，文件已发，请查收；如有问题随时联系我。'},
+    {id:5, text:'li.ming@example.com'},
+  ];
+  let nextId = 6;
+
+  /* ---------- 标签切换 ---------- */
+  const grid = document.getElementById('grid');
+  const tabs = document.querySelectorAll('.tab');
+  let view = 'all';
+
+  const LINKS = {
+    work:[['#5b8def','folder','项目文档'],['#4caf7d','chat','部门群'],['#e0a23f','mail','工作邮箱'],['#8e6fd8','cal','周例会']],
+    tools:[['#4caf7d','globe','浏览器'],['#e0666f','term','终端'],['#5b8def','folder','下载'],['#8e6fd8','gear','控制面板']],
+  };
+  const ICONS = {
+    folder:'<path d="M2 4.5a1.5 1.5 0 0 1 1.5-1.5h3l1.5 2h6A1.5 1.5 0 0 1 15.5 6.5v6A1.5 1.5 0 0 1 14 14H3.5A1.5 1.5 0 0 1 2 12.5z"/>',
+    chat:'<path d="M2.5 3.5h11v8h-7l-4 3z"/>',
+    mail:'<rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="M2.5 4.5 8 9l5.5-4.5"/>',
+    cal:'<rect x="2.5" y="3" width="11" height="10.5" rx="1.5"/><path d="M2.5 6.5h11M5.5 1.5v3M10.5 1.5v3"/>',
+    globe:'<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2a9 9 0 0 1 0 12M8 2a9 9 0 0 0 0 12"/>',
+    term:'<rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M4.5 6.5 7 8.5l-2.5 2M8.5 11h3.5"/>',
+    gear:'<circle cx="8" cy="8" r="2.2"/><path d="M8 1.8v2M8 12.2v2M1.8 8h2M12.2 8h2M3.6 3.6l1.4 1.4M11 11l1.4 1.4M12.4 3.6 11 5M5 11l-1.4 1.4"/>',
+  };
+
+  function linkCard([color,icon,name]){
+    return `<div class="linkcard">
+      <div class="lico" style="background:${color}"><svg viewBox="0 0 16 16">${ICONS[icon]}</svg></div>
+      <div class="t">${name}</div></div>`;
+  }
+
+  function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;'); }
+
+  function clipCard(c){
+    return `<div class="clipcard" data-id="${c.id}" title="${esc(c.text)}">
+      <button class="mini del" data-act="del" title="删除"><svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8"/></svg></button>
+      <button class="mini edit" data-act="edit" title="编辑"><svg viewBox="0 0 16 16"><path d="M11.5 2.5 13.5 4.5 5.5 12.5 3 13l.5-2.5z"/></svg></button>
+      <div class="txt">${esc(c.text)}</div>
+      <div class="hint"><svg viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2"/></svg>点击复制全文</div>
+    </div>`;
+  }
+
+  function render(){
+    tabs.forEach(t=>t.classList.toggle('sel', t.dataset.view===view));
+    if(view==='clip'){
+      grid.innerHTML = clips.map(clipCard).join('')
+        + `<div class="addcard" id="addCard" title="添加剪切板文本">＋</div>`;
+    }else{
+      const list = view==='all' ? [...LINKS.work,...LINKS.tools] : LINKS[view];
+      grid.innerHTML = list.map(linkCard).join('');
+    }
+  }
+  tabs.forEach(t=>t.onclick=()=>{ view=t.dataset.view; render(); });
+  render();
+
+  /* ---------- 复制（真实生效） ---------- */
+  function copyText(s){
+    if(navigator.clipboard && window.isSecureContext!==false){
+      navigator.clipboard.writeText(s).catch(()=>fallbackCopy(s));
+    }else fallbackCopy(s);
+  }
+  function fallbackCopy(s){
+    const ta=document.createElement('textarea'); ta.value=s;
+    ta.style.cssText='position:fixed;opacity:0'; document.body.appendChild(ta);
+    ta.select(); try{document.execCommand('copy');}catch(e){} ta.remove();
+  }
+
+  let toastTimer=null;
+  function toast(msg){
+    const el=document.getElementById('toast');
+    document.getElementById('toastTxt').textContent=msg||'已复制到剪贴板';
+    el.classList.add('show');
+    clearTimeout(toastTimer);
+    toastTimer=setTimeout(()=>el.classList.remove('show'),1500);
+  }
+
+  /* ---------- 卡片交互 ---------- */
+  const ctx=document.getElementById('ctx');
+  let ctxId=null;
+  function closeCtx(){ ctx.classList.remove('open'); }
+
+  grid.addEventListener('click',e=>{
+    const add=e.target.closest('#addCard');
+    if(add){ openDlg(); return; }
+    const mini=e.target.closest('.mini');
+    const card=e.target.closest('.clipcard');
+    if(card){
+      const id=+card.dataset.id, c=clips.find(x=>x.id===id);
+      if(mini){ if(mini.dataset.act==='edit') openDlg(c); else delClip(id); return; }
+      copyText(c.text);
+      card.classList.add('copied');
+      setTimeout(()=>card.classList.remove('copied'),700);
+      toast('已复制到剪贴板');
+    }
+  });
+
+  grid.addEventListener('contextmenu',e=>{
+    const card=e.target.closest('.clipcard');
+    if(!card) return;
+    e.preventDefault();
+    ctxId=+card.dataset.id;
+    const wr=win.getBoundingClientRect(), cr=grid.getBoundingClientRect();
+    ctx.style.left=(e.clientX-wr.left)+'px';
+    ctx.style.top =(e.clientY-wr.top)+'px';
+    ctx.classList.add('open');
+  });
+  ctx.addEventListener('click',e=>{
+    const b=e.target.closest('button'); if(!b||ctxId==null) return;
+    const c=clips.find(x=>x.id===ctxId);
+    if(b.dataset.act==='copy'){ copyText(c.text); toast('已复制到剪贴板'); }
+    if(b.dataset.act==='edit') openDlg(c);
+    if(b.dataset.act==='del')  delClip(ctxId);
+    closeCtx();
+  });
+  document.addEventListener('mousedown',e=>{ if(!ctx.contains(e.target)) closeCtx(); });
+
+  function delClip(id){
+    clips=clips.filter(x=>x.id!==id);
+    render(); toast('已删除');
+  }
+
+  /* ---------- 添加 / 编辑对话框 ---------- */
+  const mask=document.getElementById('mask'), dlgText=document.getElementById('dlgText');
+  let editId=null;
+  function openDlg(c){
+    editId = c ? c.id : null;
+    document.getElementById('dlgTitle').textContent = c?'编辑剪切板文本':'添加剪切板文本';
+    dlgText.value = c ? c.text : '';
+    mask.classList.add('open');
+    closeCtx();
+    setTimeout(()=>{ dlgText.focus(); },30);
+  }
+  function closeDlg(){ mask.classList.remove('open'); }
+  document.getElementById('dlgOk').onclick=()=>{
+    const v=dlgText.value.trim(); if(!v) return;
+    if(editId!=null) clips.find(x=>x.id===editId).text=v;
+    else clips.push({id:nextId++, text:v});
+    closeDlg(); render();
+  };
+  document.getElementById('dlgCancel').onclick=closeDlg;
+  document.getElementById('dlgX').onclick=closeDlg;
+  mask.addEventListener('mousedown',e=>{ if(e.target===mask) closeDlg(); });
+  dlgText.addEventListener('keydown',e=>{ if(e.key==='Enter'&&!e.shiftKey){ e.preventDefault(); document.getElementById('dlgOk').click(); } });
+
+  /* ---------- 主题切换 ---------- */
+  const thD=document.getElementById('thDark'), thL=document.getElementById('thLight');
+  thD.onclick=()=>{ document.body.classList.remove('light'); thD.classList.add('on'); thL.classList.remove('on'); };
+  thL.onclick=()=>{ document.body.classList.add('light'); thL.classList.add('on'); thD.classList.remove('on'); };
+</script>
+</body>
+</html>
