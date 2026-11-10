@@ -38,7 +38,7 @@
 namespace gp = Gdiplus;
 
 // ---------------- 数据模型 ----------------
-enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2, CLIP_TYPE = 3 };
+enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2, NT_SNIPPET = 3, CLIP_TYPE = 4 };
 enum { R_NONE = 0, R_TITLE, R_TAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN, R_BTN_PLAY,
        R_CLIPBTN, R_CLIPADD };
 
@@ -47,7 +47,8 @@ static const int CLIP_TAG = -1;       // g_curTag 特殊值：「剪切板」固
 struct Node {
     int id = 0, type = 0, parent = 0;
     int order = 0;                        // 拖拽排序键（旧文件缺省 = 读入序）
-    int admin = 0;                        // 默认以管理员启动（仅链接；URL 忽略）
+    int admin = 0;                        // 默认以管理员启动（仅链接/片段；URL 忽略）
+    int ps = 0, cmd = 0;                  // 启动方式：cmd/ps 互斥，全 0=直接打开；片段必居其一
     std::wstring name, path, params;
 };
 
@@ -58,14 +59,14 @@ struct Clip {                             // 剪切板条目：点击卡片 = �
 
 // 菜单命令 ID
 enum {
-    M_ADDTAG = 101, M_ADDLINK, M_PIN, M_HIDEFOCUS, M_AUTOSTART, M_HOTKEY, M_EXIT, M_LISTEN,
+    M_ADDTAG = 101, M_ADDLINK, M_ADDSNIP, M_PIN, M_HIDEFOCUS, M_AUTOSTART, M_HOTKEY, M_EXIT, M_LISTEN,
     M_ICON0 = 111, M_ICON1, M_ICON2,              // 图标 小/中/大
     M_SORT0 = 121, M_SORT1, M_SORT2,               // 排序 添加顺序/名称升/名称降
     M_THEME0 = 131, M_THEME1,                      // 主题 深色/浅色
     L_OPEN = 201, L_ADMIN, L_LOC, L_EDIT, L_DEL,
-    T_ADDLINK = 301, T_REN, T_DEL,
+    T_ADDLINK = 301, T_ADDSNIP, T_REN, T_DEL,
     CL_COPY = 401, CL_EDIT, CL_DEL, CL_ADD,        // 剪切板条目/空白菜单
-    BG_ADDTAG = 501, BG_ADDLINK,
+    BG_ADDTAG = 501, BG_ADDLINK, BG_ADDSNIP,
     TR_SHOW = 601, TR_EXIT
 };
 
@@ -104,6 +105,7 @@ static int  g_hoverReg = R_NONE, g_hoverIdx = -1, g_hoverSub = -1;
 static int  g_pressIdx = -1;            // 左键按下的网格单元：拖拽/单击共用起点
 static bool g_dragging = false;
 static POINT g_pressPt{};
+static POINT g_dragPt{};                // 拖拽中光标位置：浮起卡片绘制用
 
 static std::wstring g_iniConf, g_iniLinks, g_iniClips;
 static NOTIFYICONDATAW g_nid = {};
@@ -113,7 +115,9 @@ static RECT g_rcTitle, g_rcTag, g_rcGrid;
 static std::vector<RECT> g_rcTabs;   // [0]="全部"，之后为各标签
 static RECT g_rcBtns[4];             // 0=关闭 1=菜单 2=钉住 3=播放
 static RECT g_rcDlgX;                // 编辑对话框右上角关闭区
-static RECT g_rcDlgChk;              // 编辑对话框「以管理员启动」勾选区（非链接弹窗为空）
+static RECT g_rcDlgChk;              // 编辑对话框「以管理员启动」勾选区（非链接/片段弹窗为空）
+static RECT g_rcDlgCmd;              // 弹窗「CMD」勾选区（无 CMD/PS 勾选的弹窗为空）
+static RECT g_rcDlgPs;               // 片段弹窗「PowerShell」勾选区（其他弹窗为空）
 struct DlgBtn { RECT rc; int id; const wchar_t* txt; bool primary; };
 static std::vector<DlgBtn> g_dlgBtns;
 static std::vector<RECT>   g_dlgEdits;
@@ -177,7 +181,7 @@ static void GdipCard(gp::Graphics&, const RECT&, FLOAT, COLORREF);
 static void DrawDlgFace(HWND, HDC);
 static bool EnableRoundedCorner(HWND, COLORREF);
 static void ApplyRoundRegion(HWND, bool);
-static void LaunchLink(Node* n, bool admin);
+static void LaunchLink(Node* n, int mode);            // 0=默认 1=管理员
 static void OpenEditor(int type, int parent, const Node* src);
 static void OpenClipEditor(const Clip* src);
 static void HideWin();
@@ -267,10 +271,24 @@ static void SaveNode(const Node& n) {
     WritePrivateProfileStringW(sec, L"path",   n.path.c_str(),   g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"params", n.params.c_str(), g_iniLinks.c_str());
     WritePrivateProfileStringW(sec, L"admin",  std::to_wstring(n.admin).c_str(), g_iniLinks.c_str());
+    WritePrivateProfileStringW(sec, L"ps",     std::to_wstring(n.ps).c_str(), g_iniLinks.c_str());
+    WritePrivateProfileStringW(sec, L"cmd",    std::to_wstring(n.cmd).c_str(), g_iniLinks.c_str());
 }
 
 static void SaveNextId() {
     WritePrivateProfileStringW(L"meta", L"next", std::to_wstring(g_nextId).c_str(), g_iniLinks.c_str());
+}
+
+// ini 值存不了换行，片段命令的换行编为 \x01 落盘，展示/执行前还原
+static std::wstring EncNewl(const std::wstring& s) {
+    std::wstring r = s;
+    for (auto& ch : r) if (ch == L'\n') ch = L'\x01';
+    return r;
+}
+static std::wstring DecNewl(const std::wstring& s) {
+    std::wstring r = s;
+    for (auto& ch : r) if (ch == L'\x01') ch = L'\n';
+    return r;
 }
 
 static void DeleteNodeCascade(int id) {
@@ -322,6 +340,8 @@ static void LoadNodes() {
         GetPrivateProfileStringW(sec, L"path", L"", buf, 1024, g_iniLinks.c_str());   n.path = buf;
         GetPrivateProfileStringW(sec, L"params", L"", buf, 1024, g_iniLinks.c_str()); n.params = buf;
         n.admin = GetPrivateProfileIntW(sec, L"admin", 0, g_iniLinks.c_str());
+        n.ps    = GetPrivateProfileIntW(sec, L"ps", 0, g_iniLinks.c_str());
+        n.cmd   = GetPrivateProfileIntW(sec, L"cmd", 0, g_iniLinks.c_str());
         g_nodes.push_back(n);
     }
     std::stable_sort(g_nodes.begin(), g_nodes.end(),
@@ -426,7 +446,7 @@ static void SaveOrdersNow() {
 static void RebuildView() {
     g_view.clear(); g_scroll = 0;
     for (auto& n : g_nodes) {
-        if (n.type != NT_LINK) continue;
+        if (n.type != NT_LINK && n.type != NT_SNIPPET) continue;
         if (g_curTag == 0 || n.parent == g_curTag) g_view.push_back(&n);
     }
     if (g_sortMode) {                                   // 0=添加顺序（g_nodes 原始次序）
@@ -506,7 +526,11 @@ static HICON IconFor(const Node& n) {
     HICON h = nullptr;
     SHFILEINFOW fi = {};
     bool isUrl = !wcsncmp(n.path.c_str(), L"http://", 7) || !wcsncmp(n.path.c_str(), L"https://", 8);
-    if (isUrl) {                                          // 借 .url 注册表类型取地球图标
+    if (n.type == NT_SNIPPET) {                           // 片段：借 cmd/powershell 取终端图标
+        if (SHGetFileInfoW(n.ps ? L"powershell.exe" : L"cmd.exe", FILE_ATTRIBUTE_NORMAL, &fi, sizeof fi,
+                           SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES))
+            h = fi.hIcon;
+    } else if (isUrl) {                                   // 借 .url 注册表类型取地球图标
         if (SHGetFileInfoW(L"x.url", FILE_ATTRIBUTE_NORMAL, &fi, sizeof fi,
                            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES))
             h = fi.hIcon;
@@ -523,16 +547,58 @@ static HICON IconFor(const Node& n) {
 }
 
 // ---------------- 启动链接 ----------------
-static void LaunchLink(Node* n, bool admin) {
-    if (admin && n->path.find(L"://") != std::wstring::npos)
-        admin = false;                                    // runas 对 URL 协议无效，忽略之
+static void LaunchLink(Node* n, int mode) {               // 0=默认 1=管理员
+    if (mode == 1 && n->path.find(L"://") != std::wstring::npos)
+        mode = 0;                                         // runas 对 URL 协议无效，忽略之
     SHELLEXECUTEINFOW sei = {};
     sei.cbSize = sizeof sei;
     sei.fMask = SEE_MASK_NOASYNC | SEE_MASK_UNICODE;
     sei.hwnd = g_hwnd;
-    sei.lpVerb = admin ? L"runas" : nullptr;
-    sei.lpFile = n->path.c_str();
-    if (!n->params.empty()) sei.lpParameters = n->params.c_str();
+    std::wstring args, dir;
+    if (n->type == NT_SNIPPET) {                          // 片段：CMD / PowerShell 执行整条命令
+        const std::wstring cmd = DecNewl(n->path);
+        if (n->ps) {
+            sei.lpFile = L"powershell.exe";
+            args = L"-NoProfile -ExecutionPolicy Bypass -Command " + cmd;
+        } else {
+            sei.lpFile = L"cmd.exe";
+            args = L"/c " + cmd;
+        }
+        if (mode == 1) sei.lpVerb = L"runas";
+        sei.lpParameters = args.c_str();
+    } else {
+        DWORD attr = GetFileAttributesW(n->path.c_str());
+        bool isDir = attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY);
+        bool isExe = n->path.size() > 4 && !_wcsicmp(n->path.c_str() + n->path.size() - 4, L".exe");
+        size_t sl = n->path.find_last_of(L'\\');
+        if (sl != std::wstring::npos) {                   // 提权后 CWD 会变 System32，显式传文件所在目录
+            dir = n->path.substr(0, sl + 1);
+            sei.lpDirectory = dir.c_str();
+        }
+        if (n->ps && attr != INVALID_FILE_ATTRIBUTES) {       // 链接以 PowerShell 执行（-File，URL 无文件属性自动跳过）
+            sei.lpFile = L"powershell.exe";
+            args = L"-NoProfile -ExecutionPolicy Bypass -File \"" + n->path + L"\"";
+            if (!n->params.empty()) args += L' ' + n->params;
+            if (mode == 1) sei.lpVerb = L"runas";
+            sei.lpParameters = args.c_str();
+        } else if (n->cmd && attr != INVALID_FILE_ATTRIBUTES) {   // 链接借 cmd /c 执行
+            sei.lpFile = L"cmd.exe";
+            args = L"/c \"" + n->path + L"\"";
+            if (!n->params.empty()) args += L' ' + n->params;
+            if (mode == 1) sei.lpVerb = L"runas";
+            sei.lpParameters = args.c_str();
+        } else if (mode == 1 && !isDir && !isExe) {       // 文档/lnk：runas 直接提权常报无关联，借 start 走用户关联
+            sei.lpVerb = L"runas";
+            sei.lpFile = L"cmd.exe";
+            args = L"/c start \"\" \"" + n->path + L"\"";
+            if (!n->params.empty()) args += L' ' + n->params;
+            sei.lpParameters = args.c_str();
+        } else {
+            sei.lpVerb = mode == 1 ? L"runas" : nullptr;
+            sei.lpFile = n->path.c_str();
+            if (!n->params.empty()) sei.lpParameters = n->params.c_str();
+        }
+    }
     sei.nShow = SW_SHOWNORMAL;
     if (ShellExecuteExW(&sei)) {
         if (g_hideAfterLaunch) HideWin();
@@ -769,15 +835,20 @@ static Hit HitTest(POINT p) {
 // ---------------- 编辑对话框 ----------------
 struct EditCtx {
     bool isNew = false; int type = NT_LINK, parent = 0, id = 0;
-    bool admin = false;
+    bool admin = false, ps = false, cmd = false;
     int clipId = 0;                       // CLIP_TYPE：剪切板条目 id
     std::wstring name, path, params;
 };
 static EditCtx g_ctx;
 
 static void EditorApply() {
-    wchar_t buf[1024];
-    GetWindowTextW(g_hName, buf, 1024); g_ctx.name = buf;
+    auto text = [](HWND c) {                                 // 多行片段命令可能超 1024 字符，按长度取
+        int n = GetWindowTextLengthW(c);
+        std::wstring s(n, L'\0');
+        if (n) GetWindowTextW(c, &s[0], n + 1);
+        return s;
+    };
+    g_ctx.name = text(g_hName);                              // 名称留空时片段自动取命令首词
     if (g_ctx.type == CLIP_TYPE) {                        // 剪切板：只存一段单行文本
         if (g_ctx.name.empty()) { MessageBoxW(g_hDlg, L"请填写文本。", L"启动器", MB_OK | MB_ICONWARNING); return; }
         if (g_ctx.isNew) {
@@ -792,9 +863,15 @@ static void EditorApply() {
     }
     g_ctx.path.clear(); g_ctx.params.clear();
     if (g_ctx.type == NT_LINK) {
-        GetWindowTextW(g_hPath, buf, 1024); g_ctx.path = buf;
-        GetWindowTextW(g_hParams, buf, 1024); g_ctx.params = buf;
+        g_ctx.path = text(g_hPath);
+        g_ctx.params = text(g_hParams);
         if (g_ctx.path.empty()) { MessageBoxW(g_hDlg, L"请填写目标路径或网址。", L"启动器", MB_OK | MB_ICONWARNING); return; }
+    } else if (g_ctx.type == NT_SNIPPET) {
+        g_ctx.path = text(g_hPath);
+        if (g_ctx.path.empty()) { MessageBoxW(g_hDlg, L"请输入命令。", L"启动器", MB_OK | MB_ICONWARNING); return; }
+        if (g_ctx.name.empty())                             // 名称留空：自动取命令首词
+            g_ctx.name = g_ctx.path.substr(0, g_ctx.path.find_first_of(L" \n"));
+        g_ctx.path = EncNewl(g_ctx.path);
     }
     if (g_ctx.name.empty()) { MessageBoxW(g_hDlg, L"请填写名称。", L"启动器", MB_OK | MB_ICONWARNING); return; }
 
@@ -803,12 +880,16 @@ static void EditorApply() {
         n.id = g_nextId++; n.type = g_ctx.type; n.parent = g_ctx.parent;
         n.name = g_ctx.name; n.path = g_ctx.path; n.params = g_ctx.params;
         n.admin = g_ctx.admin ? 1 : 0;
+        n.ps = g_ctx.ps ? 1 : 0;
+        n.cmd = g_ctx.cmd ? 1 : 0;
         n.order = (int)g_nodes.size();
         g_nodes.push_back(n); SaveNode(n); SaveNextId();
         if (n.type == NT_TAG) g_curTag = n.id;
     } else if (Node* n = Find(g_ctx.id)) {
         n->name = g_ctx.name; n->path = g_ctx.path; n->params = g_ctx.params;
         n->admin = g_ctx.admin ? 1 : 0;
+        n->ps = g_ctx.ps ? 1 : 0;
+        n->cmd = g_ctx.cmd ? 1 : 0;
         SaveNode(*n);
     }
     Refresh();
@@ -850,19 +931,24 @@ static void DrawDlgFace(HWND h, HDC dc) {
         GdipFillRound(g, r, S(8), C_INSET, 255);
         GdipStrokeRound(g, r, S(8), C_SPLIT, 200, 1.0f);
     }
-    if (!IsRectEmpty(&g_rcDlgChk)) {                          // 管理员勾选框（仅链接编辑弹窗）
-        RECT box = g_rcDlgChk; box.right = box.left + S(16);
-        box.top = (g_rcDlgChk.top + g_rcDlgChk.bottom) / 2 - S(8); box.bottom = box.top + S(16);
-        if (g_ctx.admin) {
-            GdipFillRound(g, box, S(4), C_ACC, 255);
-            DrawGlyph(dc, box, 0xE73E, C_ONTXT);              // CheckMark
-        } else {
-            GdipFillRound(g, box, S(4), C_INSET, 255);
-            GdipStrokeRound(g, box, S(4), C_SPLIT, 200, 1.0f);
-        }
-        RECT tx = g_rcDlgChk; tx.left = box.right + S(8);
-        DrawTextRect(dc, tx, L"默认以管理员身份启动", g_fUi, C_TEXT,
-                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    {                                                         // 勾选框：管理员 + 片段的 CMD/PowerShell
+        auto chk = [&](const RECT& area, bool on, const wchar_t* txt) {
+            RECT box = area; box.right = box.left + S(16);
+            box.top = (area.top + area.bottom) / 2 - S(8); box.bottom = box.top + S(16);
+            if (on) {
+                GdipFillRound(g, box, S(4), C_ACC, 255);
+                DrawGlyph(dc, box, 0xE73E, C_ONTXT);          // CheckMark
+            } else {
+                GdipFillRound(g, box, S(4), C_INSET, 255);
+                GdipStrokeRound(g, box, S(4), C_SPLIT, 200, 1.0f);
+            }
+            RECT tx = area; tx.left = box.right + S(8);
+            DrawTextRect(dc, tx, txt, g_fUi, C_TEXT,
+                         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        };
+        if (!IsRectEmpty(&g_rcDlgChk)) chk(g_rcDlgChk, g_ctx.admin, L"以管理员身份启动");
+        if (!IsRectEmpty(&g_rcDlgCmd)) chk(g_rcDlgCmd, g_ctx.cmd, L"CMD");        // 与 PowerShell 互斥，全不勾=直接打开
+        if (!IsRectEmpty(&g_rcDlgPs))  chk(g_rcDlgPs, g_ctx.ps, L"PowerShell");
     }
     DrawDlgBtns(dc);
     DrawGlyph(dc, g_rcDlgX, 0xE711, C_MUT);
@@ -874,16 +960,18 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // 自绘对话框：仅 EDIT 是子窗口，标签/按钮/边框全部 WM_PAINT 绘制
         int type = (int)(INT_PTR)((CREATESTRUCTW*)l)->lpCreateParams;
         g_dlgBtns.clear(); g_dlgEdits.clear();
+        g_rcDlgChk = g_rcDlgCmd = g_rcDlgPs = {};             // 勾选区全局矩形，每次弹窗先清
         g_hName = g_hPath = g_hParams = nullptr;
         HINSTANCE inst = ((CREATESTRUCTW*)l)->hInstance;
         auto label = [&](const wchar_t* t, int px, int py) {
             CreateWindowExW(0, L"STATIC", t, WS_CHILD | WS_VISIBLE,
                             px, py, S(48), S(18), h, nullptr, inst, nullptr);
         };
-        auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id) -> HWND {
-            g_dlgEdits.push_back({ px, py, px + pw, py + S(28) });   // 外圈：父窗口画圆角底+描边
-            HWND c = CreateWindowExW(0, L"EDIT", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL,
-                                     px + S(2), py + S(2), pw - S(4), S(28) - S(4),
+        auto edit = [&](int px, int py, int pw, const wchar_t* txt, int id,
+                        int ph = S(28), DWORD es = ES_AUTOHSCROLL) -> HWND {
+            g_dlgEdits.push_back({ px, py, px + pw, py + ph });   // 外圈：父窗口画圆角底+描边
+            HWND c = CreateWindowExW(0, L"EDIT", txt, WS_CHILD | WS_VISIBLE | WS_TABSTOP | es,
+                                     px + S(2), py + S(2), pw - S(4), ph - S(4),
                                      h, (HMENU)(INT_PTR)id, inst, nullptr);
             SendMessageW(c, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(8), S(8)));
             return c;
@@ -892,26 +980,42 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_dlgBtns.push_back({ { px, py, px + pw, py + S(28) }, id, txt, pri });
         };
         int x = S(16), lw = S(48), fw = S(380) - x * 2 - lw;
-        label(type == CLIP_TYPE ? L"文本" : L"名称", x, S(46) + S(5));
-        g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
         int by;
-        if (type == NT_LINK) {
-            label(L"目标", x, S(88) + S(5));
-            g_hPath = edit(x + lw, S(88), fw - S(80), g_ctx.path.c_str(), IDC_PATH);
-            btn(S(380) - x - S(72), S(88), S(72), IDC_BROWSE, L"浏览…", false);
-            label(L"参数", x, S(130) + S(5));
-            g_hParams = edit(x + lw, S(130), fw, g_ctx.params.c_str(), IDC_PARAMS);
-            g_rcDlgChk = { x, S(170), x + S(170), S(170) + S(24) };
-            by = S(206);
+        if (type == NT_SNIPPET) {                             // 代码片段：名称 + 多行命令文本域
+            label(L"名称", x, S(46) + S(5));
+            g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
+            label(L"命令", x, S(88) + S(5));
+            g_hPath = edit(x + lw, S(88), fw, g_ctx.path.c_str(), IDC_PATH, S(112),
+                           ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL);
+            g_rcDlgChk = { x, S(212), x + S(170), S(212) + S(24) };   // 管理员
+            g_rcDlgCmd = { S(194), S(212), S(264), S(212) + S(24) };
+            g_rcDlgPs  = { S(272), S(212), S(364), S(212) + S(24) };
+            by = S(246);
         } else {
-            g_rcDlgChk = {};
-            by = S(96);
+            label(L"名称", x, S(46) + S(5));
+            g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
+            if (type == NT_LINK) {
+                label(L"目标", x, S(88) + S(5));
+                g_hPath = edit(x + lw, S(88), fw - S(80), g_ctx.path.c_str(), IDC_PATH);
+                btn(S(380) - x - S(72), S(88), S(72), IDC_BROWSE, L"浏览…", false);
+                label(L"参数", x, S(130) + S(5));
+                g_hParams = edit(x + lw, S(130), fw, g_ctx.params.c_str(), IDC_PARAMS);
+                g_rcDlgChk = { x, S(170), x + S(170), S(170) + S(24) };   // 链接同样三勾选：管理员/CMD/PowerShell
+                g_rcDlgCmd = { S(194), S(170), S(264), S(170) + S(24) };
+                g_rcDlgPs  = { S(272), S(170), S(364), S(170) + S(24) };
+                by = S(206);
+            } else {
+                label(type == CLIP_TYPE ? L"文本" : L"名称", x, S(46) + S(5));
+                g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
+                by = S(96);
+            }
         }
         btn(S(380) - x - S(88) * 2 - S(8), by, S(88), IDOK, L"确定", true);
         btn(S(380) - x - S(88), by, S(88), IDCANCEL, L"取消", false);
         g_rcDlgX = { S(380) - S(40), 0, S(380) - S(8), S(36) };
-        SendMessageW(g_hName, EM_SETSEL, 0, -1);
-        SetFocus(g_hName);
+        HWND focus = g_hName ? g_hName : g_hPath;             // 无名称框时聚焦命令框
+        SendMessageW(focus, EM_SETSEL, 0, -1);
+        SetFocus(focus);
         return 0;
     }
     case WM_PAINT: {
@@ -944,6 +1048,18 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
+        if (!IsRectEmpty(&g_rcDlgCmd) && PtInRect(&g_rcDlgCmd, pt)) {
+            g_ctx.cmd = !g_ctx.cmd;                       // CMD / PowerShell 互斥
+            if (g_ctx.cmd) g_ctx.ps = false;
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        if (!IsRectEmpty(&g_rcDlgPs) && PtInRect(&g_rcDlgPs, pt)) {
+            g_ctx.ps = !g_ctx.ps;
+            if (g_ctx.ps) g_ctx.cmd = false;
+            InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
         if (const DlgBtn* b = FindDlgBtn(pt)) {
             if (b->id == IDOK) EditorApply();
             else if (b->id == IDCANCEL) DestroyWindow(h);
@@ -969,7 +1085,8 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SETCURSOR: {
         if (LOWORD(l) == HTCLIENT) {
             POINT pt; GetCursorPos(&pt); ScreenToClient(h, &pt);
-            bool hand = PtInRect(&g_rcDlgX, pt) || PtInRect(&g_rcDlgChk, pt) || FindDlgBtn(pt);
+            bool hand = PtInRect(&g_rcDlgX, pt) || PtInRect(&g_rcDlgChk, pt)
+                     || PtInRect(&g_rcDlgCmd, pt) || PtInRect(&g_rcDlgPs, pt) || FindDlgBtn(pt);
             SetCursor(LoadCursorW(nullptr, hand ? IDC_HAND : IDC_ARROW));
             return TRUE;
         }
@@ -1013,14 +1130,19 @@ static void OpenEditor(int type, int parent, const Node* src) {
     if (src) {
         g_ctx.id = src->id; g_ctx.type = src->type; g_ctx.parent = src->parent;
         g_ctx.name = src->name; g_ctx.path = src->path; g_ctx.params = src->params;
+        if (src->type == NT_SNIPPET) g_ctx.path = DecNewl(src->path);   // 片段命令换行还原到编辑框
         g_ctx.admin = src->admin != 0;
+        g_ctx.ps = src->ps != 0;
+        g_ctx.cmd = src->cmd != 0;
     } else {
         g_ctx.type = type; g_ctx.parent = parent;
+        if (type == NT_SNIPPET) g_ctx.cmd = true;             // 新建片段默认 CMD
     }
     const wchar_t* title = g_ctx.isNew
-        ? (type == NT_LINK ? L"添加链接" : L"添加标签")
-        : L"编辑";
-    OpenDlgCentered(title, (g_ctx.type == NT_LINK) ? S(246) : S(140), g_ctx.type);
+        ? (type == NT_LINK ? L"添加链接" : type == NT_SNIPPET ? L"新建代码片段" : L"添加标签")
+        : (type == NT_SNIPPET ? L"编辑代码片段" : L"编辑");
+    OpenDlgCentered(title, g_ctx.type == NT_LINK ? S(246) : g_ctx.type == NT_SNIPPET ? S(290) : S(140),
+                    g_ctx.type);
 }
 
 // 剪切板条目添加/编辑：与链接编辑共用 DLG_CLASS 自绘对话框，仅一个输入框
@@ -1341,6 +1463,7 @@ static void ShowMainMenu() {
     for (int i = 0; i < 2; i++) MAdd(mt, M_THEME0 + i, kTheme[i], g_theme == i);
     MAdd(m, M_ADDTAG, L"添加标签");
     MAdd(m, M_ADDLINK, L"添加链接");
+    MAdd(m, M_ADDSNIP, L"添加代码片段");
     MSub(m, L"图标大小", mi);
     MSub(m, L"排序方式", ms);
     MSub(m, L"主题", mt);
@@ -1359,6 +1482,7 @@ static void ShowMainMenu() {
     switch (cmd) {
     case M_ADDTAG: OpenEditor(NT_TAG, 0, nullptr); break;
     case M_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
+    case M_ADDSNIP: OpenEditor(NT_SNIPPET, EnsureCurTag(), nullptr); break;
     case M_PIN: g_pinned = !g_pinned; ApplyPin(); SaveWinPos(); InvalidateRect(g_hwnd, nullptr, FALSE); break;
     case M_HIDEFOCUS: g_hideOnFocus = !g_hideOnFocus; SaveWinPos(); break;
     case M_AUTOSTART:
@@ -1394,7 +1518,7 @@ static void ShowMainMenu() {
 }
 
 static void ShowLinkMenu(Node* n, POINT scr) {
-    bool hasDir = n->path.find(L'\\') != std::wstring::npos;
+    bool hasDir = n->type == NT_LINK && n->path.find(L'\\') != std::wstring::npos;
     std::vector<MItem> m;
     MAdd(m, L_OPEN, L"打开");
     MAdd(m, L_ADMIN, L"以管理员身份运行");
@@ -1403,8 +1527,8 @@ static void ShowLinkMenu(Node* n, POINT scr) {
     MAdd(m, L_EDIT, L"编辑");
     MAdd(m, L_DEL, L"删除");
     switch (MPopup(std::move(m), scr)) {
-    case L_OPEN: LaunchLink(n, false); break;
-    case L_ADMIN: LaunchLink(n, true); break;
+    case L_OPEN: LaunchLink(n, 0); break;
+    case L_ADMIN: LaunchLink(n, 1); break;
     case L_LOC: {
         std::wstring dir = n->path.substr(0, n->path.find_last_of(L"\\/"));
         ShellExecuteW(g_hwnd, L"open", dir.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -1421,11 +1545,13 @@ static void ShowLinkMenu(Node* n, POINT scr) {
 static void ShowTagMenu(Node* tag, POINT scr) {
     std::vector<MItem> m;
     MAdd(m, T_ADDLINK, L"添加链接");
+    MAdd(m, T_ADDSNIP, L"添加代码片段");
     MSep(m);
     MAdd(m, T_REN, L"重命名");
     MAdd(m, T_DEL, L"删除");
     switch (MPopup(std::move(m), scr)) {
     case T_ADDLINK: OpenEditor(NT_LINK, tag->id, nullptr); break;
+    case T_ADDSNIP: OpenEditor(NT_SNIPPET, tag->id, nullptr); break;
     case T_REN: OpenEditor(0, 0, tag); break;
     case T_DEL:
         DeleteNodeCascade(tag->id);
@@ -1443,9 +1569,11 @@ static void ShowGridBgMenu(POINT scr) {
         return;
     }
     MAdd(m, BG_ADDLINK, L"添加链接");
+    MAdd(m, BG_ADDSNIP, L"添加代码片段");
     MAdd(m, BG_ADDTAG, L"添加标签");
     switch (MPopup(std::move(m), scr)) {
     case BG_ADDLINK: OpenEditor(NT_LINK, EnsureCurTag(), nullptr); break;
+    case BG_ADDSNIP: OpenEditor(NT_SNIPPET, EnsureCurTag(), nullptr); break;
     case BG_ADDTAG:  OpenEditor(NT_TAG, 0, nullptr); break;
     }
 }
@@ -1669,13 +1797,9 @@ static void PaintAll(HDC dc) {
         int saved = SaveDC(dc);
         IntersectClipRect(dc, inner.left, inner.top, inner.right, inner.bottom);
         gp::Graphics gc(dc); GdipSetup(gc);
-        for (int i = 0; i < (int)g_clipView.size(); i++) {
-            RECT r = CellRect(i);
-            if (r.bottom < inner.top || r.top > inner.bottom) continue;
-            bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i && !(g_dragging && g_pressIdx == i));
-            bool drag = (g_dragging && g_pressIdx == i);
+        auto drawClipCard = [&](int i, RECT r, bool hot, bool drag) {
             bool flash = (i == g_flashIdx && GetTickCount() - g_flashTick < 1000);
-            GdipCard(gc, r, S(10), (hot || drag) ? C_HOVER : C_CARD);
+            GdipCard(gc, r, S(10), hot ? C_HOVER : C_CARD);
             if (drag || flash) GdipStrokeRound(gc, r, S(10), C_ACC, 255, 2.0f);
             // hover 右上角小圆钮：删 / 编
             RECT bd, be; ClipBtnRects(r, bd, be);
@@ -1685,7 +1809,7 @@ static void PaintAll(HDC dc) {
             };
             for (auto& b : btns) {
                 bool bh = (g_hoverReg == R_CLIPBTN && g_hoverIdx == i && g_hoverSub == b.sub);
-                if (hot || drag || bh) {
+                if (hot || bh) {
                     GdipFillRound(gc, b.rc, S(9), bh && !drag ? C_ACC : C_INSET, 255);
                     DrawGlyph(dc, b.rc, b.glyph, bh && !drag ? C_ONTXT : C_MUT);
                 }
@@ -1707,6 +1831,12 @@ static void PaintAll(HDC dc) {
             else if (hot)
                 DrawTextRect(dc, hr, L"点击复制全文", g_fSmall, C_MUT,
                              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        };
+        for (int i = 0; i < (int)g_clipView.size(); i++) {
+            RECT r = CellRect(i);
+            if (r.bottom < inner.top || r.top > inner.bottom) continue;
+            if (g_dragging && i == g_pressIdx) continue;   // 被拖卡片浮起跟手，原槽位留空
+            drawClipCard(i, r, g_hoverReg == R_CELL && g_hoverIdx == i, false);
         }
         RECT ar = CellRect((int)g_clipView.size());        // 「＋」添加卡
         if (ar.bottom >= inner.top && ar.top <= inner.bottom) {
@@ -1714,6 +1844,11 @@ static void PaintAll(HDC dc) {
             GdipCard(gc, ar, S(10), hot ? C_HOVER : C_CARD);
             DrawTextRect(dc, ar, L"＋", g_fUi, hot ? C_ACC : C_MUT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        if (g_dragging && g_pressIdx >= 0 && g_pressIdx < (int)g_clipView.size()) {
+            RECT gr{ g_dragPt.x - ClipW() / 2, g_dragPt.y - ClipH() / 2,   // 按住的那张浮起跟随光标
+                     g_dragPt.x - ClipW() / 2 + ClipW(), g_dragPt.y - ClipH() / 2 + ClipH() };
+            drawClipCard(g_pressIdx, gr, true, true);
         }
         RestoreDC(dc, saved);
         if (g_clipView.empty())
@@ -1728,19 +1863,13 @@ static void PaintAll(HDC dc) {
         int saved = SaveDC(dc);
         IntersectClipRect(dc, inner.left, inner.top, inner.right, inner.bottom);
         gp::Graphics gc(dc); GdipSetup(gc);
-        for (int i = 0; i < (int)g_view.size(); i++) {
-            RECT r = CellRect(i);
-            if (r.bottom < inner.top || r.top > inner.bottom) continue;
-            bool hot = (g_hoverReg == R_CELL && g_hoverIdx == i && !(g_dragging && g_pressIdx == i));
-            bool drag = (g_dragging && g_pressIdx == i);
-            GdipCard(gc, r, S(12), (hot || drag) ? C_HOVER : C_CARD);
-            if (drag) GdipStrokeRound(gc, r, S(12), C_ACC, 255, 2.0f);   // 拖拽中的卡片描主色边
-            HICON ic = IconFor(*g_view[i]);
+        auto drawCardBody = [&](const Node& nd, RECT r) {
+            HICON ic = IconFor(nd);
             int iy = r.top + S(12);
             if (ic) DrawIconEx(dc, r.left + (CellW() - isz) / 2, iy, ic,
                                isz, isz, 0, nullptr, DI_NORMAL);
             int ty = iy + isz + S(6);
-            auto lines = WrapText(dc, g_view[i]->name, CellW() - S(12), 2);
+            auto lines = WrapText(dc, nd.name, CellW() - S(12), 2);
             if (lines.size() == 1) ty += TextLineH() / 2;      // 单行时垂直居中，不贴顶
             for (size_t k = 0; k < lines.size(); k++) {
                 RECT lr{ r.left + S(6), ty + (int)k * TextLineH(),
@@ -1748,6 +1877,20 @@ static void PaintAll(HDC dc) {
                 DrawTextRect(dc, lr, lines[k].c_str(), g_fUi, C_TEXT,
                              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
+        };
+        for (int i = 0; i < (int)g_view.size(); i++) {
+            RECT r = CellRect(i);
+            if (r.bottom < inner.top || r.top > inner.bottom) continue;
+            if (g_dragging && i == g_pressIdx) continue;   // 被拖卡片原槽位留空：落点一目了然
+            GdipCard(gc, r, S(12), (g_hoverReg == R_CELL && g_hoverIdx == i) ? C_HOVER : C_CARD);
+            drawCardBody(*g_view[i], r);
+        }
+        if (g_dragging && g_pressIdx >= 0 && g_pressIdx < (int)g_view.size()) {
+            RECT gr{ g_dragPt.x - CellW() / 2, g_dragPt.y - CellH() / 2,    // 按住的那张浮起跟随光标
+                     g_dragPt.x - CellW() / 2 + CellW(), g_dragPt.y - CellH() / 2 + CellH() };
+            GdipCard(gc, gr, S(12), C_HOVER);
+            GdipStrokeRound(gc, gr, S(12), C_ACC, 255, 2.0f);   // 主色描边标明「拖的是这张」
+            drawCardBody(*g_view[g_pressIdx], gr);
         }
         RestoreDC(dc, saved);
     }
@@ -1815,7 +1958,7 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_dlgBtns.push_back({ { S(300) - S(16) - S(88), S(128),
                                 S(300) - S(16), S(156) }, IDCANCEL, L"取消", false });
         g_rcDlgX = { S(300) - S(40), 0, S(300) - S(8), S(36) };
-        g_rcDlgChk = {};
+        g_rcDlgChk = g_rcDlgCmd = g_rcDlgPs = {};
         SetFocus(h);
         return 0;
     }
@@ -2268,7 +2411,7 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         g_dlgBtns.push_back({ { S(380) - x - S(88), S(204), S(380) - x, S(204) + S(28) },
                               IDCANCEL, L"取消", false });
         g_rcDlgX = { S(380) - S(40), 0, S(380) - S(8), S(36) };
-        g_rcDlgChk = {};
+        g_rcDlgChk = g_rcDlgCmd = g_rcDlgPs = {};
         return 0;
     }
     case WM_PAINT: {
@@ -2471,6 +2614,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         Hit hh = HitTest(pt);
         if (g_pressIdx >= 0) {                            // 按住左键：先判定拖拽，松手未拖则按单击处理
             bool changed = false;
+            if (g_dragging) { g_dragPt = pt; changed = true; }   // 浮起卡片跟手，每帧重绘
             if (!g_dragging &&
                 (abs(pt.x - g_pressPt.x) > S(6) || abs(pt.y - g_pressPt.y) > S(6))) {
                 g_dragging = InClipView() || (g_sortMode == 0);   // 剪切板恒可拖；名称排序下链接拖不出可见效果，禁用拖拽
@@ -2523,7 +2667,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         Hit hh = HitTest(pt);
         switch (hh.reg) {
         case R_CELL:                                      // 按住待判定：拖拽换位 或 松手单击
-            g_pressIdx = hh.idx; g_pressPt = pt;
+            g_pressIdx = hh.idx; g_pressPt = pt; g_dragPt = pt;
             SetCapture(h);
             break;
         case R_CLIPBTN: {                                 // 剪切板小钮：立即执行，不进拖拽
