@@ -1,5 +1,8 @@
 build/
 dist/
+.uploads/
+.screenshots/
+.trae-html-share-packages/
 *.aps
 *.obj
 *.res
