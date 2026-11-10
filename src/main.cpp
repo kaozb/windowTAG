@@ -1,7 +1,7 @@
 // ============================================================
-// 快速启动面板 · M1
+// 快速启动面板
 // 纯 Win32 + GDI 自绘，零第三方依赖；数据存 INI（系统 API）
-// 数据模型：分组(NT_GROUP) → 标签(NT_TAG) → 链接(NT_LINK) 自引用树
+// 数据模型：标签(NT_TAG) → 链接(NT_LINK)/片段(NT_SNIPPET)，剪切板(CLIP_TYPE)独立存放
 // ============================================================
 #ifndef UNICODE
 #define UNICODE
@@ -38,7 +38,7 @@
 namespace gp = Gdiplus;
 
 // ---------------- 数据模型 ----------------
-enum { NT_GROUP = 0, NT_TAG = 1, NT_LINK = 2, NT_SNIPPET = 3, CLIP_TYPE = 4 };
+enum { NT_TAG = 1, NT_LINK = 2, NT_SNIPPET = 3, CLIP_TYPE = 4 };
 enum { R_NONE = 0, R_TITLE, R_TAG, R_CELL, R_BTN_CLOSE, R_BTN_MENU, R_BTN_PIN, R_BTN_PLAY,
        R_CLIPBTN, R_CLIPADD };
 
@@ -100,7 +100,7 @@ static DWORD  g_flashTick = 0;
 
 static bool g_pinned = false, g_hideOnFocus = true, g_hideAfterLaunch = true;
 static bool g_autoStart = true;         // 开机自启（HKCU Run），默认开
-static bool g_tracking = false, g_startHidden = false;
+static bool g_tracking = false;
 static int  g_hoverReg = R_NONE, g_hoverIdx = -1, g_hoverSub = -1;
 static int  g_pressIdx = -1;            // 左键按下的网格单元：拖拽/单击共用起点
 static bool g_dragging = false;
@@ -326,19 +326,19 @@ static void Seed() {
 static void LoadNodes() {
     g_nodes.clear();
     g_nextId = GetPrivateProfileIntW(L"meta", L"next", 1, g_iniLinks.c_str());
-    wchar_t buf[1024];
+    wchar_t buf[8192];
     for (int i = 1; i < g_nextId; i++) {
         wchar_t sec[32]; wsprintfW(sec, L"node.%d", i);
-        GetPrivateProfileStringW(sec, L"type", L"\x1", buf, 1024, g_iniLinks.c_str());
+        GetPrivateProfileStringW(sec, L"type", L"\x1", buf, 8192, g_iniLinks.c_str());
         if (!wcscmp(buf, L"\x1")) continue;              // 节不存在 = 已删除
         Node n;
         n.id = i;
         n.type = _wtoi(buf);
         n.parent = GetPrivateProfileIntW(sec, L"parent", 0, g_iniLinks.c_str());
         n.order  = GetPrivateProfileIntW(sec, L"order", i, g_iniLinks.c_str());
-        GetPrivateProfileStringW(sec, L"name", L"", buf, 1024, g_iniLinks.c_str());   n.name = buf;
-        GetPrivateProfileStringW(sec, L"path", L"", buf, 1024, g_iniLinks.c_str());   n.path = buf;
-        GetPrivateProfileStringW(sec, L"params", L"", buf, 1024, g_iniLinks.c_str()); n.params = buf;
+        GetPrivateProfileStringW(sec, L"name", L"", buf, 8192, g_iniLinks.c_str());   n.name = buf;
+        GetPrivateProfileStringW(sec, L"path", L"", buf, 8192, g_iniLinks.c_str());   n.path = buf;
+        GetPrivateProfileStringW(sec, L"params", L"", buf, 8192, g_iniLinks.c_str()); n.params = buf;
         n.admin = GetPrivateProfileIntW(sec, L"admin", 0, g_iniLinks.c_str());
         n.ps    = GetPrivateProfileIntW(sec, L"ps", 0, g_iniLinks.c_str());
         n.cmd   = GetPrivateProfileIntW(sec, L"cmd", 0, g_iniLinks.c_str());
@@ -891,6 +891,11 @@ static void EditorApply() {
         n->ps = g_ctx.ps ? 1 : 0;
         n->cmd = g_ctx.cmd ? 1 : 0;
         SaveNode(*n);
+        auto ic = g_icons.find(n->id);                    // 路径/执行方式可能已变，图标缓存作废
+        if (ic != g_icons.end()) {
+            if (ic->second) DestroyIcon(ic->second);
+            g_icons.erase(ic);
+        }
     }
     Refresh();
     DestroyWindow(g_hDlg);
@@ -992,7 +997,7 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_rcDlgPs  = { S(272), S(212), S(364), S(212) + S(24) };
             by = S(246);
         } else {
-            label(L"名称", x, S(46) + S(5));
+            label(type == CLIP_TYPE ? L"文本" : L"名称", x, S(46) + S(5));
             g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
             if (type == NT_LINK) {
                 label(L"目标", x, S(88) + S(5));
@@ -1005,8 +1010,6 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 g_rcDlgPs  = { S(272), S(170), S(364), S(170) + S(24) };
                 by = S(206);
             } else {
-                label(type == CLIP_TYPE ? L"文本" : L"名称", x, S(46) + S(5));
-                g_hName = edit(x + lw, S(46), fw, g_ctx.name.c_str(), IDC_NAME);
                 by = S(96);
             }
         }
@@ -2875,7 +2878,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     g_iconIdx          = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"iconSize", 1, g_iniConf.c_str())));
     g_sortMode         = std::min(2, std::max(0, (int)GetPrivateProfileIntW(L"ui", L"sort", 0, g_iniConf.c_str())));
     ApplyTheme((int)GetPrivateProfileIntW(L"ui", L"theme", 0, g_iniConf.c_str()));   // 深色为默认
-    g_startHidden      = GetPrivateProfileIntW(L"behavior", L"startHidden", 0, g_iniConf.c_str()) != 0;
     g_listenPort       = GetPrivateProfileIntW(L"listen", L"port", 22222, g_iniConf.c_str());
     if (g_listenPort < 0 || g_listenPort > 65535) g_listenPort = 22222;
     g_toastSec         = GetPrivateProfileIntW(L"listen", L"toast", 5, g_iniConf.c_str());
@@ -2968,7 +2970,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     SetWindowPos(g_hwnd, nullptr, 0, 0, 0, 0,
                  SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
-    if (!g_startHidden) ShowWin();
+    ShowWin();
     if (g_autoStart) ApplyAutoStart(true);   // 默认开：每次启动刷新 Run 路径，exe 挪位后自动跟上
 
     MSG msg;
