@@ -2073,7 +2073,8 @@ static std::string WideToUtf8(const std::wstring& w) {
     return s;
 }
 
-// 宽松解析 {"msg":"XXXX"}：取到 msg 字符串值即成功（支持常规转义，容忍 UTF-8 BOM）
+// 兼容旧格式 {"msg":"XXXX"}：取到 msg 字符串值即成功（支持常规转义，容忍 UTF-8 BOM）；
+// 解析失败时调用方把整个请求体当作内容
 static bool ParseMsgJson(const std::wstring& body, std::wstring& out) {
     size_t i = body.find_first_not_of(L" \t\r\n\xFEFF");
     if (i == std::wstring::npos || body[i] != L'{') return false;
@@ -2194,6 +2195,14 @@ static void HandleClient(SOCKET c, DWORD peer, const std::wstring& allow) {
             std::wstring w(wl, 0);
             MultiByteToWideChar(CP_UTF8, 0, body.data(), (int)body.size(), &w[0], wl);
             good = ParseMsgJson(w, msg);
+            if (!good) {                       // 请求体即内容：curl -d 消息内容 http://IP:端口
+                size_t i = w.find_first_not_of(L" \t\r\n\xFEFF");
+                if (i != std::wstring::npos) {
+                    size_t j = w.find_last_not_of(L" \t\r\n\xFEFF");
+                    msg = w.substr(i, j - i + 1);
+                    good = true;
+                }
+            }
         }
     }
     if (good) {
@@ -2202,16 +2211,13 @@ static void HandleClient(SOCKET c, DWORD peer, const std::wstring& allow) {
         wmemcpy(heap, msg.c_str(), msg.size() + 1);
         if (!PostMessageW(g_hwnd, WM_MSG, 0, (LPARAM)heap)) delete[] heap;   // 窗口已销毁等场景不丢不漏
     } else if (!IpAllowed(wip, allow)) {
-        char tip[128];                                        // 与格式错误分开：被白名单拦下要能一眼看出
+        char tip[128];                                        // 与空请求体分开：被白名单拦下要能一眼看出
         snprintf(tip, sizeof tip, "来源 IP %s 不在允许的前缀内", ip);
         SendHttp(c, 403, "Forbidden", tip);
-    } else if (body.empty()) {
-        SendHttp(c, 400, "Bad Request",
-                 WideToUtf8(L"未读到请求体。请按照 {\"msg\":\"XXXXX\"}这个格式发送"));
     } else {
-        std::string r = "收到: " + body.substr(0, 120) +
-                        " 。请按照 {\"msg\":\"XXXXX\"}这个格式发送";   // 回显便于发现客户端转义/引号问题
-        SendHttp(c, 400, "Bad Request", r);
+        SendHttp(c, 400, "Bad Request",
+                 WideToUtf8(L"未读到请求体。把要显示的文字直接作为请求体发送即可，"
+                            L"如 curl -d 消息内容 http://IP:端口"));
     }
     closesocket(c);
 }
