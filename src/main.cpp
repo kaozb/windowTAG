@@ -2311,9 +2311,11 @@ static void StopListener() {
 }
 
 // ---------------- 消息弹框（主显示器正中 · 最上层 · 不抢焦点） ----------------
+// 纯色极简：深色主题白底黑字、浅色主题黑底白字（与桌面互为反色），尺寸随内容自适应
 static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_ERASEBKGND: return 1;
+    case WM_SIZE: ApplyRoundRegion(h, true); return 0;
     case WM_LBUTTONDOWN:                                   // 主动点击：立即消失
         KillTimer(h, 1);
         FadeOut(h, 120);
@@ -2324,30 +2326,18 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
-        gp::Graphics g(dc); GdipSetup(g);
-        // 饱和渐变底 + 白描边：纯白（浏览器）/纯黑桌面上都一眼可见
-        gp::GraphicsPath p;
-        GdipPathRound(p, gp::RectF(0, 0, (FLOAT)rc.right, (FLOAT)rc.bottom), (FLOAT)S(14));
-        gp::LinearGradientBrush br(gp::PointF(0, 0),
-                                   gp::PointF((FLOAT)rc.right, (FLOAT)rc.bottom),
-                                   gp::Color(255, 70, 110, 225),
-                                   gp::Color(255, 168, 68, 205));
-        g.FillPath(&br, &p);
-        GdipStrokeRound(g, rc, S(14), C_WHITE, 210, 1.5f);
-        // 顶部小标签 + 底部操作提示
-        DrawGlyph(dc, { S(12), S(8), S(30), S(26) }, 0xE8BD, RGB(225, 232, 255));
-        DrawTextRect(dc, { S(32), S(8), rc.right - S(12), S(26) }, L"消息",
-                     g_fSmall, RGB(225, 232, 255), DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        DrawTextRect(dc, { 0, rc.bottom - S(22), rc.right, rc.bottom - S(6) }, L"点击关闭",
-                     g_fSmall, RGB(220, 228, 255), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        COLORREF bg = (g_theme == 0) ? RGB(255, 255, 255) : RGB(0, 0, 0);
+        COLORREF fg = (g_theme == 0) ? RGB(0, 0, 0) : RGB(255, 255, 255);
+        HBRUSH br = CreateSolidBrush(bg);
+        FillRect(dc, &rc, br);
+        DeleteObject(br);
         std::wstring txt = g_msgText.empty() ? L"(空消息)" : g_msgText;
-        auto lines = WrapText(dc, txt, rc.right - S(36), 3);
-        int top = S(28);
+        auto lines = WrapText(dc, txt, rc.right - S(36), 8);
         int tot = (int)lines.size() * TextLineH();
-        int y = top + (rc.bottom - S(24) - top - tot) / 2;
+        int y = (rc.bottom - tot) / 2;
         for (size_t i = 0; i < lines.size(); i++) {
             RECT lr{ S(18), y + (int)i * TextLineH(), rc.right - S(18), y + (int)(i + 1) * TextLineH() };
-            DrawTextRect(dc, lr, lines[i].c_str(), g_fUiB, C_WHITE,
+            DrawTextRect(dc, lr, lines[i].c_str(), g_fUiB, fg,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
         EndPaint(h, &ps);
@@ -2361,7 +2351,6 @@ static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 }
 
 static void ShowToast(const std::wstring& text) {
-    int w = S(240), h = S(120);
     if (!g_hToast) {
         WNDCLASSW tc = {};
         tc.lpfnWndProc = ToastProc;
@@ -2371,15 +2360,28 @@ static void ShowToast(const std::wstring& text) {
         tc.lpszClassName = TOAST_CLASS;
         RegisterClassW(&tc);
         g_hToast = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, TOAST_CLASS, L"",
-                                   WS_POPUP, 0, 0, w, h, nullptr, nullptr, g_hInst, nullptr);
+                                   WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_hInst, nullptr);
         if (!g_hToast) return;
         EnableRoundedCorner(g_hToast, C_EDGE);
-        ApplyRoundRegion(g_hToast, true);
     }
     g_msgText = text;
+    // 尺寸随内容：按 3/5 屏宽折行（至多 8 行，超出省略号），宽取最长行，高随行数
+    std::wstring txt = text.empty() ? L"(空消息)" : text;
+    HDC dc = GetDC(nullptr);
+    int maxTW = GetSystemMetrics(SM_CXSCREEN) * 3 / 5;
+    auto lines = WrapText(dc, txt, maxTW, 8);
+    int lw = 0;
+    for (auto& ln : lines) {
+        SIZE sz{}; GetTextExtentPoint32W(dc, ln.c_str(), (int)ln.size(), &sz);
+        if (sz.cx > lw) lw = sz.cx;
+    }
+    ReleaseDC(nullptr, dc);
+    int w = lw + S(36);
+    if (w < S(120)) w = S(120);
+    int h = (int)lines.size() * TextLineH() + S(32);
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;       // 主显示器正中
     int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
-    SetWindowPos(g_hToast, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    SetWindowPos(g_hToast, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
     FadeIn(g_hToast, 120, SW_SHOWNOACTIVATE);
     InvalidateRect(g_hToast, nullptr, FALSE);
     if (g_toastSec > 0) SetTimer(g_hToast, 1, g_toastSec * 1000, nullptr);   // 新消息重置计时
