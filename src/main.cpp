@@ -190,6 +190,7 @@ static void GdipStrokeRound(gp::Graphics&, const RECT&, FLOAT, COLORREF, BYTE, F
 static void GdipCard(gp::Graphics&, const RECT&, FLOAT, COLORREF, bool shadow = true);
 static void GdipInset(gp::Graphics&, const RECT&, FLOAT);
 static void GdipSheen(gp::Graphics&, const gp::RectF&, FLOAT, BYTE);
+static void GdipRim(gp::Graphics&, const RECT&, FLOAT, BYTE);
 static COLORREF Mix(COLORREF, COLORREF, int);
 static gp::Color Col(COLORREF, BYTE);
 static void DrawDlgFace(HWND, HDC);
@@ -937,14 +938,15 @@ static void DrawDlgBtns(HDC dc) {
 static void DrawDlgFace(HWND h, HDC dc) {
     RECT rc; GetClientRect(h, &rc);
     bool dark = g_theme == 0;
-    {   // 玻璃面板脸面：垂直渐变 + 顶部镜面高光 + 内缘描边（圆角与窗口区域 S(16) 对齐）
+    {   // 玻璃面板脸面：垂直渐变 + 受光表达 + 内缘描边（圆角与窗口区域 S(16) 对齐）
         gp::Graphics g0(dc); GdipSetup(g0);
         gp::RectF rf(0, 0, (FLOAT)rc.right, (FLOAT)rc.bottom);
-        gp::LinearGradientBrush fb(rf, Col(Mix(C_CARD, C_WHITE, dark ? 6 : 40), 255),
+        gp::LinearGradientBrush fb(rf, Col(Mix(C_CARD, C_WHITE, dark ? 3 : 40), 255),
                                    Col(Mix(C_CARD, C_SHAD, dark ? 12 : 5), 255),
                                    gp::LinearGradientModeVertical);
         g0.FillRectangle(&fb, rf);
-        GdipSheen(g0, rf, S(16), (BYTE)(dark ? 22 : 60));
+        if (dark) GdipRim(g0, rc, S(16), 70);           // 深色：棱边亮线，面上不上白
+        else      GdipSheen(g0, rf, S(16), 60);
         GdipStrokeRound(g0, rc, S(16), dark ? C_WHITE : C_SPLIT, (BYTE)(dark ? 26 : 110), 1.0f);
     }
     wchar_t title[128]; GetWindowTextW(h, title, 128);
@@ -1304,7 +1306,7 @@ static void MenuRender(MPanel* p) {
     gp::RectF rf((FLOAT)pr.left, (FLOAT)pr.top,
                  (FLOAT)(pr.right - pr.left), (FLOAT)(pr.bottom - pr.top));
     GdipFillRound(g, pr, rad, C_MENU, 224);                  // 半透明玻璃面板
-    GdipSheen(g, rf, rad, (BYTE)(dark ? 30 : 70));
+    if (!dark) GdipSheen(g, rf, rad, 70);                    // 深色面板平涂不上白，靠描边棱线
     GdipStrokeRound(g, pr, rad, dark ? C_WHITE : C_SPLIT, (BYTE)(dark ? 36 : 120), 1.0f);
     for (size_t i = 0; i < p->items.size(); i++) {
         const MItem& it = p->items[i];
@@ -1720,7 +1722,7 @@ static void GdipPathTopRound(gp::GraphicsPath& p, const gp::RectF& rf, FLOAT rad
     p.CloseFigure();
 }
 
-// 顶部镜面高光带：上亮下透的白色渐变，玻璃「受光面」的核心质感
+// 顶部镜面高光带：上亮下透的白色渐变，玻璃「受光面」的核心质感（浅色主题用）
 static void GdipSheen(gp::Graphics& g, const gp::RectF& rf, FLOAT rad, BYTE a) {
     FLOAT sh = rf.Height * 0.45f;
     if (sh < rad) sh = rad;
@@ -1732,7 +1734,18 @@ static void GdipSheen(gp::Graphics& g, const gp::RectF& rf, FLOAT rad, BYTE a) {
     g.FillPath(&b, &p);
 }
 
-// 液态玻璃浮起卡片：软阴影 + 垂直渐变玻璃体 + 顶部镜面高光 + 外亮缘/内暗缘双描边
+// 顶部棱边亮线：沿圆角轮廓的垂直渐变描边，顶亮、向下渐隐——深色玻璃的「棱边反光」，
+// 白只留在棱边不铺在面上，避免深色主题整体上白下黑
+static void GdipRim(gp::Graphics& g, const RECT& r, FLOAT rad, BYTE aTop) {
+    gp::RectF rf((FLOAT)r.left, (FLOAT)r.top, (FLOAT)(r.right - r.left), (FLOAT)(r.bottom - r.top));
+    gp::GraphicsPath p; GdipPathRound(p, rf, rad);
+    gp::LinearGradientBrush b(rf, Col(C_WHITE, aTop), Col(C_WHITE, 0), gp::LinearGradientModeVertical);
+    gp::Pen pen(&b, 1.0f);
+    g.DrawPath(&pen, &p);
+}
+
+// 液态玻璃浮起卡片：软阴影 + 垂直渐变玻璃体 + 受光表达 + 外亮缘/内暗缘双描边
+// 浅色=镜面高光带；深色=玻璃体近乎平涂 + 顶部棱边亮线（表面不上白）
 static void GdipCard(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF body, bool shadow) {
     bool dark = g_theme == 0;
     if (shadow) {
@@ -1744,11 +1757,12 @@ static void GdipCard(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF body, b
     }
     gp::RectF rf((FLOAT)r.left, (FLOAT)r.top, (FLOAT)(r.right - r.left), (FLOAT)(r.bottom - r.top));
     gp::GraphicsPath p; GdipPathRound(p, rf, rad);
-    gp::LinearGradientBrush fb(rf, Col(Mix(body, C_WHITE, dark ? 10 : 55), 255),
+    gp::LinearGradientBrush fb(rf, Col(Mix(body, C_WHITE, dark ? 3 : 55), 255),
                                Col(Mix(body, C_SHAD, dark ? 16 : 7), 255),
                                gp::LinearGradientModeVertical);
     g.FillPath(&fb, &p);
-    GdipSheen(g, rf, rad, (BYTE)(dark ? 40 : 60));
+    if (dark) GdipRim(g, r, rad, 85);
+    else      GdipSheen(g, rf, rad, 60);
     GdipStrokeRound(g, r, rad, dark ? C_WHITE : C_SPLIT, (BYTE)(dark ? 34 : 120), 1.0f);
     RECT ri{ r.left + 1, r.top + 1, r.right - 1, r.bottom - 1 };
     GdipStrokeRound(g, ri, rad > 1.5f ? rad - 1 : rad, dark ? C_SHAD : C_WHITE,
@@ -1796,10 +1810,10 @@ static void PaintAll(HDC dc) {
     auto tl = TagList();
     RECT rcAll{ 0, 0, g_rcTitle.right, g_rcGrid.bottom };
     bool dark = g_theme == 0;
-    {   // 全窗玻璃底：垂直渐变替代平涂
+    {   // 全窗玻璃底：垂直渐变替代平涂（深色近平涂，避免上白下黑）
         gp::Graphics gw(dc); GdipSetup(gw);
         gp::RectF wf(0, 0, (FLOAT)rcAll.right, (FLOAT)rcAll.bottom);
-        gp::LinearGradientBrush wb(wf, Col(Mix(C_BG, C_WHITE, dark ? 5 : 40), 255),
+        gp::LinearGradientBrush wb(wf, Col(Mix(C_BG, C_WHITE, dark ? 2 : 40), 255),
                                    Col(Mix(C_BG, C_SHAD, dark ? 12 : 10), 255),
                                    gp::LinearGradientModeVertical);
         gw.FillRectangle(&wb, wf);
@@ -2423,10 +2437,11 @@ static void ToastRender() {
     COLORREF body = dark ? RGB(34, 37, 44) : RGB(248, 249, 252);   // 深色近墨玻璃 / 浅色近云玻璃
     BYTE ba = dark ? 214 : 226;                                    // 透出桌面的玻璃底
     gp::GraphicsPath p; GdipPathRound(p, rf, rad);
-    gp::LinearGradientBrush fb(rf, Col(Mix(body, C_WHITE, dark ? 10 : 35), ba), Col(body, ba),
+    gp::LinearGradientBrush fb(rf, Col(Mix(body, C_WHITE, dark ? 3 : 35), ba), Col(body, ba),
                                gp::LinearGradientModeVertical);
     g.FillPath(&fb, &p);
-    GdipSheen(g, rf, rad, dark ? 44 : 85);
+    if (dark) GdipRim(g, pr, rad, 70);                       // 深色：棱边亮线，面上不上白
+    else      GdipSheen(g, rf, rad, 85);
     GdipStrokeRound(g, pr, rad, dark ? C_WHITE : C_SPLIT, dark ? 40 : 130, 1.0f);
     std::wstring txt = g_msgText.empty() ? L"(空消息)" : g_msgText;
     auto lines = WrapText(g_tstDC, txt, (pr.right - pr.left) - S(36), 8);
