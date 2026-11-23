@@ -139,34 +139,44 @@ static bool   g_wsaOk = false;
 static std::wstring g_msgText;           // 弹框当前文本
 // GDI 资源
 static HFONT g_fUi, g_fUiB, g_fSmall, g_fGlyph, g_fTitle;
-static HBRUSH g_brBg, g_brCard, g_brInset;
+static HBRUSH g_brInset;
 static HDC g_memDC = nullptr; static HBITMAP g_memBmp = nullptr, g_memOld = nullptr;
 static int g_memW = 0, g_memH = 0;
 static ULONG_PTR g_gdipToken;
 
-// 配色：同一组语义槽位，两套值。0=深色（默认，取自用户提供的 Global 配色表）1=浅色
+// 配色语义槽位（两套主题共用的同一组名字）
 static COLORREF C_BG, C_WHITE, C_BAR, C_CARD, C_HOVER, C_INSET, C_SHAD,
                 C_TEXT, C_MUT, C_ACC, C_ONTXT, C_SPLIT, C_EDGE, C_MENU, C_MENUH;
 static int g_theme = 0;
 
+// 液态玻璃配色：同一组语义槽位，两套值。0=深色（默认）1=浅色；
+// 整体冷调偏灰蓝，悬停/菜单悬停由主色混出玻璃 tint（源头在这里，别处只引用槽位）
+static COLORREF Mix(COLORREF a, COLORREF b, int pct) {  // 向 b 混 pct%
+    return RGB(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * pct / 100,
+               GetGValue(a) + (GetGValue(b) - GetGValue(a)) * pct / 100,
+               GetBValue(a) + (GetBValue(b) - GetBValue(a)) * pct / 100);
+}
+
 static void ApplyTheme(int idx) {
     g_theme = (idx == 1) ? 1 : 0;
     if (g_theme == 0) {
-        C_BG    = RGB(32, 32, 32); C_BAR  = RGB(51, 51, 51); C_CARD = RGB(59, 59, 59);
-        C_HOVER = RGB(69, 69, 69); C_INSET = RGB(43, 43, 43); C_SHAD = RGB(0, 0, 0);
-        C_TEXT  = RGB(255, 255, 255); C_MUT = RGB(146, 146, 146);
-        C_SPLIT = RGB(107, 107, 107); C_EDGE = RGB(36, 36, 36);
-        C_MENU  = RGB(74, 74, 74);     C_MENUH = RGB(97, 97, 97);
+        C_BG    = RGB(25, 27, 32); C_BAR  = RGB(41, 45, 53); C_CARD = RGB(57, 62, 71);
+        C_INSET = RGB(36, 40, 47); C_SHAD = RGB(0, 0, 0);
+        C_TEXT  = RGB(255, 255, 255); C_MUT = RGB(148, 155, 166);
+        C_SPLIT = RGB(98, 105, 116); C_EDGE = RGB(18, 20, 24);
+        C_MENU  = RGB(45, 49, 57);
     } else {
-        C_BG    = RGB(237, 237, 237); C_BAR = RGB(248, 248, 248); C_CARD = RGB(255, 255, 255);
-        C_HOVER = RGB(238, 244, 250); C_INSET = RGB(243, 243, 243); C_SHAD = RGB(70, 70, 70);
-        C_TEXT  = RGB(34, 34, 34); C_MUT = RGB(124, 124, 124);
-        C_SPLIT = RGB(212, 212, 212); C_EDGE = RGB(198, 198, 198);
-        C_MENU  = RGB(255, 255, 255);  C_MENUH = RGB(238, 244, 250);
+        C_BG    = RGB(233, 235, 240); C_BAR = RGB(245, 247, 251); C_CARD = RGB(252, 253, 255);
+        C_INSET = RGB(236, 239, 244); C_SHAD = RGB(70, 80, 95);
+        C_TEXT  = RGB(34, 38, 46); C_MUT = RGB(122, 130, 142);
+        C_SPLIT = RGB(198, 205, 216); C_EDGE = RGB(176, 184, 198);
+        C_MENU  = RGB(251, 252, 255);
     }
     C_WHITE = RGB(255, 255, 255);
     C_ACC   = RGB(120, 150, 180);                       // 主色两套主题共用
     C_ONTXT = RGB(28, 32, 38);                          // 主色上的深色文字（白字对比度仅 2.6:1）
+    C_HOVER = Mix(C_ACC, C_CARD, g_theme == 0 ? 22 : 26);   // 卡片悬停 = 主色玻璃
+    C_MENUH = Mix(C_ACC, C_MENU, g_theme == 0 ? 42 : 40);   // 菜单悬停 = 主色玻璃
 }
 
 // ---------------- 前向声明 ----------------
@@ -177,7 +187,11 @@ static void DrawGlyph(HDC, const RECT&, wchar_t, COLORREF);
 static void GdipSetup(gp::Graphics&);
 static void GdipFillRound(gp::Graphics&, const RECT&, FLOAT, COLORREF, BYTE);
 static void GdipStrokeRound(gp::Graphics&, const RECT&, FLOAT, COLORREF, BYTE, FLOAT);
-static void GdipCard(gp::Graphics&, const RECT&, FLOAT, COLORREF);
+static void GdipCard(gp::Graphics&, const RECT&, FLOAT, COLORREF, bool shadow = true);
+static void GdipInset(gp::Graphics&, const RECT&, FLOAT);
+static void GdipSheen(gp::Graphics&, const gp::RectF&, FLOAT, BYTE);
+static COLORREF Mix(COLORREF, COLORREF, int);
+static gp::Color Col(COLORREF, BYTE);
 static void DrawDlgFace(HWND, HDC);
 static bool EnableRoundedCorner(HWND, COLORREF);
 static void ApplyRoundRegion(HWND, bool);
@@ -692,12 +706,8 @@ static void MakeFonts() {
 }
 
 static void CreateGdiRes() {
-    if (g_brBg) DeleteObject(g_brBg);
-    if (g_brCard) DeleteObject(g_brCard);
     if (g_brInset) DeleteObject(g_brInset);
-    g_brBg    = CreateSolidBrush(C_BG);
-    g_brCard  = CreateSolidBrush(C_CARD);
-    g_brInset = CreateSolidBrush(C_INSET);
+    g_brInset = CreateSolidBrush(C_INSET);                // EDIT 实心底（专用，勿用 HOLLOW 刷）
 }
 
 static void FreeMemDC() {
@@ -912,30 +922,37 @@ static void DrawDlgBtns(HDC dc) {
     for (auto& b : g_dlgBtns) {
         FLOAT rad = (FLOAT)(b.rc.bottom - b.rc.top) / 2;      // 胶囊
         if (b.primary) {
-            GdipCard(g, b.rc, rad, C_ACC);
+            GdipCard(g, b.rc, rad, C_ACC, false);
             DrawTextRect(dc, b.rc, b.txt, g_fUi, C_ONTXT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
-            GdipFillRound(g, b.rc, rad, C_INSET, 255);
-            GdipStrokeRound(g, b.rc, rad, C_SPLIT, 160, 1.0f);
+            GdipCard(g, b.rc, rad, C_INSET, false);           // 次按钮：内凹玻璃槽同色系，与脸面拉开层次
             DrawTextRect(dc, b.rc, b.txt, g_fUi, C_TEXT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
 }
 
-// 编辑/热键两弹窗共用的整面绘制（标题 + 内凹输入框 + 按钮）
+// 编辑/热键两弹窗共用的整面绘制（玻璃脸面 + 标题 + 内凹输入框 + 按钮）
 static void DrawDlgFace(HWND h, HDC dc) {
     RECT rc; GetClientRect(h, &rc);
-    FillRect(dc, &rc, g_brCard);
+    bool dark = g_theme == 0;
+    {   // 玻璃面板脸面：垂直渐变 + 顶部镜面高光 + 内缘描边（圆角与窗口区域 S(16) 对齐）
+        gp::Graphics g0(dc); GdipSetup(g0);
+        gp::RectF rf(0, 0, (FLOAT)rc.right, (FLOAT)rc.bottom);
+        gp::LinearGradientBrush fb(rf, Col(Mix(C_CARD, C_WHITE, dark ? 6 : 40), 255),
+                                   Col(Mix(C_CARD, C_SHAD, dark ? 12 : 5), 255),
+                                   gp::LinearGradientModeVertical);
+        g0.FillRectangle(&fb, rf);
+        GdipSheen(g0, rf, S(16), (BYTE)(dark ? 22 : 60));
+        GdipStrokeRound(g0, rc, S(16), dark ? C_WHITE : C_SPLIT, (BYTE)(dark ? 26 : 110), 1.0f);
+    }
     wchar_t title[128]; GetWindowTextW(h, title, 128);
     DrawTextRect(dc, { S(16), 0, S(280), S(36) }, title, g_fTitle, C_TEXT,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     gp::Graphics g(dc); GdipSetup(g);
-    for (auto& r : g_dlgEdits) {                              // 内凹输入框底 + 描边
-        GdipFillRound(g, r, S(8), C_INSET, 255);
-        GdipStrokeRound(g, r, S(8), C_SPLIT, 200, 1.0f);
-    }
+    for (auto& r : g_dlgEdits)                                // 内凹玻璃输入槽
+        GdipInset(g, r, S(8));
     {                                                         // 勾选框：管理员 + 片段的 CMD/PowerShell
         auto chk = [&](const RECT& area, bool on, const wchar_t* txt) {
             RECT box = area; box.right = box.left + S(16);
@@ -944,8 +961,7 @@ static void DrawDlgFace(HWND h, HDC dc) {
                 GdipFillRound(g, box, S(4), C_ACC, 255);
                 DrawGlyph(dc, box, 0xE73E, C_ONTXT);          // CheckMark
             } else {
-                GdipFillRound(g, box, S(4), C_INSET, 255);
-                GdipStrokeRound(g, box, S(4), C_SPLIT, 200, 1.0f);
+                GdipInset(g, box, S(4));
             }
             RECT tx = area; tx.left = box.right + S(8);
             DrawTextRect(dc, tx, txt, g_fUi, C_TEXT,
@@ -1037,11 +1053,12 @@ static LRESULT CALLBACK DlgProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SelectObject(dc, g_fUi);
         return (LRESULT)g_brInset;     // 必须实心刷：HOLLOW 刷走 PatBlt 会整块变黑
     }
-    case WM_CTLCOLORSTATIC: {
+    case WM_CTLCOLORSTATIC: {                             // 玻璃渐变脸上：STATIC 透明融入，不再垫色块
         HDC dc = (HDC)w;
-        SetBkColor(dc, C_CARD); SetTextColor(dc, C_TEXT);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, C_TEXT);
         SelectObject(dc, g_fUi);
-        return (LRESULT)g_brCard;
+        return (LRESULT)GetStockObject(NULL_BRUSH);
     }
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -1179,7 +1196,7 @@ static void MSub(std::vector<MItem>& v, const wchar_t* t, std::vector<MItem> s) 
 }
 
 static int MenuM()     { return S(10); }      // 四周阴影留白
-static int MenuRad()   { return S(10); }
+static int MenuRad()   { return S(12); }
 static int MenuItemH() { return S(30); }
 static int MenuSepH()  { return S(9); }
 static int MenuPad()   { return S(5); }
@@ -1236,27 +1253,33 @@ static float MenuSdf(float x, float y, float cx, float cy, float hw, float hh, f
     return sqrtf(ax * ax + ay * ay) + (mx < 0 ? mx : 0) - r;
 }
 
-static void MenuAlpha(MPanel* p) {
-    int m = MenuM();
-    float cx = (float)m + p->pw * 0.5f, cy = (float)m + p->ph * 0.5f;
-    float hw = p->pw * 0.5f, hh = p->ph * 0.5f, rad = (float)MenuRad(), mm = (float)m;
-    BYTE* px = (BYTE*)p->bits;
-    for (int y = 0; y < p->sh; y++) {
-        for (int x = 0; x < p->sw; x++) {
-            BYTE* q = px + ((size_t)y * p->sw + x) * 4;
+// 通用圆角面板 alpha 通道：内部抗锯齿、外部软阴影衰减（菜单/消息弹框共用）
+static void SdfAlpha(BYTE* px, int sw, int sh, float cx, float cy, float hw, float hh,
+                     float rad, BYTE shadowA) {
+    float mm = cx - hw; if (mm < 1.0f) mm = 1.0f;            // 阴影留白 = 衰减距离
+    for (int y = 0; y < sh; y++) {
+        for (int x = 0; x < sw; x++) {
+            BYTE* q = px + ((size_t)y * sw + x) * 4;
             float d = MenuSdf((float)x + 0.5f, (float)y + 0.5f, cx, cy, hw, hh, rad);
             float a;
             if (d <= -0.5f) a = 255.0f;
-            else if (d < 0.5f) a = (0.5f - d) * 255.0f;          // 边缘抗锯齿
+            else if (d < 0.5f) a = (0.5f - d) * 255.0f;      // 边缘抗锯齿
             else {
                 float t = (d - 0.5f) / mm;
-                a = t >= 1.0f ? 0.0f : (1.0f - t) * (1.0f - t) * 100.0f;   // 软阴影
+                a = t >= 1.0f ? 0.0f : (1.0f - t) * (1.0f - t) * shadowA;   // 软阴影
             }
-            float f = a / 255.0f;                                // AC_SRC_ALPHA 要求预乘
+            float f = a / 255.0f;                            // AC_SRC_ALPHA 要求预乘
             q[0] = (BYTE)(q[0] * f); q[1] = (BYTE)(q[1] * f); q[2] = (BYTE)(q[2] * f);
             q[3] = (BYTE)a;
         }
     }
+}
+
+static void MenuAlpha(MPanel* p) {
+    int m = MenuM();
+    SdfAlpha((BYTE*)p->bits, p->sw, p->sh,
+             (float)m + p->pw * 0.5f, (float)m + p->ph * 0.5f,
+             p->pw * 0.5f, p->ph * 0.5f, (float)MenuRad(), 100);
 }
 
 static void MenuRender(MPanel* p) {
@@ -1275,8 +1298,14 @@ static void MenuRender(MPanel* p) {
     memset(p->bits, 0, (size_t)p->sw * p->sh * 4);           // 透明黑：面板外即纯黑阴影
     int m = MenuM();
     RECT pr{ m, m, m + p->pw, m + p->ph };
+    bool dark = g_theme == 0;
+    FLOAT rad = (FLOAT)MenuRad();
     gp::Graphics g(p->dc); GdipSetup(g);
-    GdipFillRound(g, pr, (FLOAT)MenuRad(), C_MENU, 255);
+    gp::RectF rf((FLOAT)pr.left, (FLOAT)pr.top,
+                 (FLOAT)(pr.right - pr.left), (FLOAT)(pr.bottom - pr.top));
+    GdipFillRound(g, pr, rad, C_MENU, 224);                  // 半透明玻璃面板
+    GdipSheen(g, rf, rad, (BYTE)(dark ? 30 : 70));
+    GdipStrokeRound(g, pr, rad, dark ? C_WHITE : C_SPLIT, (BYTE)(dark ? 36 : 120), 1.0f);
     for (size_t i = 0; i < p->items.size(); i++) {
         const MItem& it = p->items[i];
         RECT r = p->rc[i];
@@ -1286,7 +1315,7 @@ static void MenuRender(MPanel* p) {
             GdipFillRound(g, ln, 0.5f, C_SPLIT, 255);
             continue;
         }
-        if ((int)i == p->hover) GdipFillRound(g, r, (FLOAT)S(6), C_MENUH, 255);
+        if ((int)i == p->hover) GdipFillRound(g, r, (FLOAT)S(6), C_MENUH, 235);
         if (it.check) DrawGlyph(p->dc, { r.left + S(2), r.top, r.left + S(20), r.bottom }, 0xE73E, C_ACC);
         RECT tr{ r.left + S(20), r.top, r.right - S(18), r.bottom };
         DrawTextRect(p->dc, tr, it.text.c_str(), g_fUi, C_TEXT,
@@ -1680,15 +1709,59 @@ static void GdipStrokeRound(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF 
     g.DrawPath(&pen, &p);
 }
 
-// 轻拟物浮起卡片：3 层淡影 + 本体 + 1px 高光描边（浅色主题需要更重的投影才看得出浮起）
-static void GdipCard(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF body) {
-    int base = (g_theme == 0) ? 21 : 30;
-    for (int i = 1; i <= 3; i++) {
-        RECT rs{ r.left, r.top + i, r.right, r.bottom + i };
-        GdipFillRound(g, rs, rad, C_SHAD, (BYTE)(base - i * 6));
+// 顶部圆角路径：镜面高光带的形状（上两角圆、底边直线）
+static void GdipPathTopRound(gp::GraphicsPath& p, const gp::RectF& rf, FLOAT rad) {
+    if (rad > rf.Width / 2)  rad = rf.Width / 2;
+    if (rad > rf.Height / 2) rad = rf.Height / 2;
+    FLOAT d = rad * 2;
+    p.AddArc(rf.X, rf.Y, d, d, 180, 90);
+    p.AddArc(rf.X + rf.Width - d, rf.Y, d, d, 270, 90);
+    p.AddLine(rf.X + rf.Width, rf.Y + rf.Height, rf.X, rf.Y + rf.Height);
+    p.CloseFigure();
+}
+
+// 顶部镜面高光带：上亮下透的白色渐变，玻璃「受光面」的核心质感
+static void GdipSheen(gp::Graphics& g, const gp::RectF& rf, FLOAT rad, BYTE a) {
+    FLOAT sh = rf.Height * 0.45f;
+    if (sh < rad) sh = rad;
+    if (sh > rf.Height) sh = rf.Height;
+    gp::GraphicsPath p;
+    GdipPathTopRound(p, gp::RectF(rf.X, rf.Y, rf.Width, sh), rad);
+    gp::LinearGradientBrush b(gp::RectF(rf.X, rf.Y, rf.Width, sh), Col(C_WHITE, a), Col(C_WHITE, 0),
+                              gp::LinearGradientModeVertical);
+    g.FillPath(&b, &p);
+}
+
+// 液态玻璃浮起卡片：软阴影 + 垂直渐变玻璃体 + 顶部镜面高光 + 外亮缘/内暗缘双描边
+static void GdipCard(gp::Graphics& g, const RECT& r, FLOAT rad, COLORREF body, bool shadow) {
+    bool dark = g_theme == 0;
+    if (shadow) {
+        int base = (g_theme == 0) ? 21 : 30;
+        for (int i = 1; i <= 3; i++) {
+            RECT rs{ r.left, r.top + i, r.right, r.bottom + i };
+            GdipFillRound(g, rs, rad, C_SHAD, (BYTE)(base - i * 6));
+        }
     }
-    GdipFillRound(g, r, rad, body, 255);
-    GdipStrokeRound(g, r, rad, C_WHITE, 22, 1.0f);
+    gp::RectF rf((FLOAT)r.left, (FLOAT)r.top, (FLOAT)(r.right - r.left), (FLOAT)(r.bottom - r.top));
+    gp::GraphicsPath p; GdipPathRound(p, rf, rad);
+    gp::LinearGradientBrush fb(rf, Col(Mix(body, C_WHITE, dark ? 10 : 55), 255),
+                               Col(Mix(body, C_SHAD, dark ? 16 : 7), 255),
+                               gp::LinearGradientModeVertical);
+    g.FillPath(&fb, &p);
+    GdipSheen(g, rf, rad, (BYTE)(dark ? 40 : 60));
+    GdipStrokeRound(g, r, rad, dark ? C_WHITE : C_SPLIT, (BYTE)(dark ? 34 : 120), 1.0f);
+    RECT ri{ r.left + 1, r.top + 1, r.right - 1, r.bottom - 1 };
+    GdipStrokeRound(g, ri, rad > 1.5f ? rad - 1 : rad, dark ? C_SHAD : C_WHITE,
+                    (BYTE)(dark ? 55 : 120), 1.0f);
+}
+
+// 内凹玻璃槽（输入框/未勾选框）：暗本体 + 外缘吃光暗线 + 内缘反光亮线（与浮起卡片明暗相反）
+static void GdipInset(gp::Graphics& g, const RECT& r, FLOAT rad) {
+    bool dark = g_theme == 0;
+    GdipFillRound(g, r, rad, C_INSET, 255);
+    GdipStrokeRound(g, r, rad, C_SHAD, (BYTE)(dark ? 110 : 70), 1.0f);
+    RECT ri{ r.left + 1, r.top + 1, r.right - 1, r.bottom - 1 };
+    GdipStrokeRound(g, ri, rad > 1.5f ? rad - 1 : rad, C_WHITE, (BYTE)(dark ? 26 : 160), 1.0f);
 }
 
 // Win11 系统圆角窗口 + 描边色；返回是否成功（Win10 无此属性，syscall 返回错误码）
@@ -1722,13 +1795,20 @@ static void ApplyRoundRegion(HWND h, bool force) {
 static void PaintAll(HDC dc) {
     auto tl = TagList();
     RECT rcAll{ 0, 0, g_rcTitle.right, g_rcGrid.bottom };
-    FillRect(dc, &rcAll, g_brBg);
+    bool dark = g_theme == 0;
+    {   // 全窗玻璃底：垂直渐变替代平涂
+        gp::Graphics gw(dc); GdipSetup(gw);
+        gp::RectF wf(0, 0, (FLOAT)rcAll.right, (FLOAT)rcAll.bottom);
+        gp::LinearGradientBrush wb(wf, Col(Mix(C_BG, C_WHITE, dark ? 5 : 40), 255),
+                                   Col(Mix(C_BG, C_SHAD, dark ? 12 : 10), 255),
+                                   gp::LinearGradientModeVertical);
+        gw.FillRectangle(&wb, wf);
+    }
     gp::Graphics g(dc); GdipSetup(g);
 
-    // 三区层级递进：标题/标签栏=BG → 内容面板=BAR → 卡片=CARD，亮度逐级浮起
+    // 三区层级递进：标题/标签栏=渐变底 → 内容面板=玻璃板 → 卡片=浮起玻璃
     RECT panel = PanelRect();
-    GdipFillRound(g, panel, S(14), C_BAR, 255);
-    GdipStrokeRound(g, panel, S(14), C_SPLIT, 140, 1.0f);
+    GdipCard(g, panel, S(16), C_BAR, false);
 
     // 标题栏：左=应用名，右=日期 + 关闭/菜单/钉住
     {
@@ -1745,12 +1825,11 @@ static void PaintAll(HDC dc) {
         bool sticky = (i == 2 && g_pinned) || (i == 3 && g_listenOn);
         bool hot = (g_hoverReg == R_BTN_CLOSE + i);
         if (hot && !sticky) {
-            GdipFillRound(g, g_rcBtns[i], S(9), C_CARD, 255);
-            GdipStrokeRound(g, g_rcBtns[i], S(9), C_SPLIT, 120, 1.0f);
+            GdipCard(g, g_rcBtns[i], S(9), C_CARD, false);
         }
         COLORREF c = C_MUT;
-        if (sticky) {                                         // 钉住/监听中：主色胶囊，一眼可辨
-            GdipFillRound(g, g_rcBtns[i], S(9), C_ACC, 255);
+        if (sticky) {                                         // 钉住/监听中：主色玻璃胶囊，一眼可辨
+            GdipCard(g, g_rcBtns[i], S(9), C_ACC, false);
             c = C_ONTXT;
         } else if (hot) {
             c = C_TEXT;
@@ -1758,7 +1837,7 @@ static void PaintAll(HDC dc) {
         DrawGlyph(dc, g_rcBtns[i], glyphs[i], c);
     }
 
-    // 标签栏：胶囊标签，选中=主色浮起；末枚=「剪切板」固定标签（图标 + 细描边）
+    // 标签栏：玻璃胶囊标签，选中=主色玻璃浮起；末枚=「剪切板」固定标签（图标）
     {
         int nTabs = (int)g_rcTabs.size();
         for (int i = 0; i < nTabs; i++) {
@@ -1771,9 +1850,8 @@ static void PaintAll(HDC dc) {
                                          : (i == 0) ? L"全部" : tl[i - 1]->name.c_str();
             FLOAT rad = (FLOAT)(g_rcTabs[i].bottom - g_rcTabs[i].top) / 2;
             if (sel)      GdipCard(g, g_rcTabs[i], rad, C_ACC);
-            else if (hot) GdipCard(g, g_rcTabs[i], rad, C_CARD);
-            if (isClip && !sel && !hot)                       // 未选中：细描边与普通标签区分
-                GdipStrokeRound(g, g_rcTabs[i], rad, C_SPLIT, 90, 1.0f);
+            else if (hot) GdipCard(g, g_rcTabs[i], rad, C_CARD, false);
+            else          GdipCard(g, g_rcTabs[i], rad, Mix(C_BAR, C_BG, 45), false);
             COLORREF tc = sel ? C_ONTXT : (hot ? C_TEXT : C_MUT);
             HFONT tf = sel ? g_fUiB : g_fUi;
             if (isClip) {                                     // 图标 + 文字整体居中
@@ -1802,8 +1880,8 @@ static void PaintAll(HDC dc) {
         gp::Graphics gc(dc); GdipSetup(gc);
         auto drawClipCard = [&](int i, RECT r, bool hot, bool drag) {
             bool flash = (i == g_flashIdx && GetTickCount() - g_flashTick < 1000);
-            GdipCard(gc, r, S(10), hot ? C_HOVER : C_CARD);
-            if (drag || flash) GdipStrokeRound(gc, r, S(10), C_ACC, 255, 2.0f);
+            GdipCard(gc, r, S(12), hot ? C_HOVER : C_CARD);
+            if (drag || flash) GdipStrokeRound(gc, r, S(12), C_ACC, 255, 2.0f);
             // hover 右上角小圆钮：删 / 编
             RECT bd, be; ClipBtnRects(r, bd, be);
             struct { RECT rc; int sub; wchar_t glyph; } btns[2] = {
@@ -1844,7 +1922,7 @@ static void PaintAll(HDC dc) {
         RECT ar = CellRect((int)g_clipView.size());        // 「＋」添加卡
         if (ar.bottom >= inner.top && ar.top <= inner.bottom) {
             bool hot = (g_hoverReg == R_CLIPADD);
-            GdipCard(gc, ar, S(10), hot ? C_HOVER : C_CARD);
+            GdipCard(gc, ar, S(12), hot ? C_HOVER : C_CARD);
             DrawTextRect(dc, ar, L"＋", g_fUi, hot ? C_ACC : C_MUT,
                          DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
@@ -1885,14 +1963,14 @@ static void PaintAll(HDC dc) {
             RECT r = CellRect(i);
             if (r.bottom < inner.top || r.top > inner.bottom) continue;
             if (g_dragging && i == g_pressIdx) continue;   // 被拖卡片原槽位留空：落点一目了然
-            GdipCard(gc, r, S(12), (g_hoverReg == R_CELL && g_hoverIdx == i) ? C_HOVER : C_CARD);
+            GdipCard(gc, r, S(14), (g_hoverReg == R_CELL && g_hoverIdx == i) ? C_HOVER : C_CARD);
             drawCardBody(*g_view[i], r);
         }
         if (g_dragging && g_pressIdx >= 0 && g_pressIdx < (int)g_view.size()) {
             RECT gr{ g_dragPt.x - CellW() / 2, g_dragPt.y - CellH() / 2,    // 按住的那张浮起跟随光标
                      g_dragPt.x - CellW() / 2 + CellW(), g_dragPt.y - CellH() / 2 + CellH() };
-            GdipCard(gc, gr, S(12), C_HOVER);
-            GdipStrokeRound(gc, gr, S(12), C_ACC, 255, 2.0f);   // 主色描边标明「拖的是这张」
+            GdipCard(gc, gr, S(14), C_HOVER);
+            GdipStrokeRound(gc, gr, S(14), C_ACC, 255, 2.0f);   // 主色描边标明「拖的是这张」
             drawCardBody(*g_view[g_pressIdx], gr);
         }
         RestoreDC(dc, saved);
@@ -1978,10 +2056,10 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)w;
         bool big = (HWND)l && GetDlgCtrlID((HWND)l) == 1;      // 键值预览：加粗主色
-        SetBkColor(dc, C_CARD);
+        SetBkMode(dc, TRANSPARENT);                            // 玻璃脸上透明融入
         SetTextColor(dc, big ? C_ACC : C_TEXT);
         SelectObject(dc, big ? g_fUiB : g_fUi);
-        return (LRESULT)g_brCard;
+        return (LRESULT)GetStockObject(NULL_BRUSH);
     }
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -2021,6 +2099,7 @@ static LRESULT CALLBACK HKProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         } else {
             g_hk.mod = mod; g_hk.vk = (int)w;                 // 任意键均可，含无修饰键的裸键
             SetWindowTextW(GetDlgItem(h, 1), HotkeyText(g_hk.mod, g_hk.vk).c_str());
+            InvalidateRect(h, nullptr, FALSE);                // 透明 STATIC 不清底：整面重绘防残影
         }
         return 0;
     }
@@ -2310,42 +2389,93 @@ static void StopListener() {
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-// ---------------- 消息弹框（主显示器正中 · 最上层 · 不抢焦点） ----------------
-// 纯色极简：深色主题白底黑字、浅色主题黑底白字（与桌面互为反色），尺寸随内容自适应
+// ---------------- 消息弹框（液态玻璃 · 主显示器正中 · 最上层 · 不抢焦点） ----------------
+// WS_EX_LAYERED + UpdateLayeredWindow 逐像素 alpha（与菜单同一套机制）：
+// 半透明玻璃体 + SDF 圆角抗锯齿 + 软阴影，淡入淡出走 ULW 常量 alpha，尺寸随内容自适应
+static HDC g_tstDC = nullptr;
+static HBITMAP g_tstBmp = nullptr, g_tstOld = nullptr;
+static void* g_tstBits = nullptr;
+static int g_tstW = 0, g_tstH = 0, g_tstX = 0, g_tstY = 0;    // 整窗尺寸（含阴影留白）与落点
+
+static void ToastFreeGfx() {
+    if (g_tstBmp) { SelectObject(g_tstDC, g_tstOld); DeleteObject(g_tstBmp); g_tstBmp = nullptr; }
+    if (g_tstDC)  { DeleteDC(g_tstDC); g_tstDC = nullptr; }
+    g_tstBits = nullptr;
+}
+
+static void ToastRender() {
+    ToastFreeGfx();
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = g_tstW; bi.bmiHeader.biHeight = -g_tstH;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    g_tstDC = CreateCompatibleDC(nullptr);
+    g_tstBmp = CreateDIBSection(g_tstDC, &bi, DIB_RGB_COLORS, &g_tstBits, nullptr, 0);
+    g_tstOld = (HBITMAP)SelectObject(g_tstDC, g_tstBmp);
+    memset(g_tstBits, 0, (size_t)g_tstW * g_tstH * 4);
+    int m = S(14);
+    RECT pr{ m, m, g_tstW - m, g_tstH - m };
+    bool dark = g_theme == 0;
+    FLOAT rad = (FLOAT)S(16);
+    gp::Graphics g(g_tstDC); GdipSetup(g);
+    gp::RectF rf((FLOAT)pr.left, (FLOAT)pr.top,
+                 (FLOAT)(pr.right - pr.left), (FLOAT)(pr.bottom - pr.top));
+    COLORREF body = dark ? RGB(34, 37, 44) : RGB(248, 249, 252);   // 深色近墨玻璃 / 浅色近云玻璃
+    BYTE ba = dark ? 214 : 226;                                    // 透出桌面的玻璃底
+    gp::GraphicsPath p; GdipPathRound(p, rf, rad);
+    gp::LinearGradientBrush fb(rf, Col(Mix(body, C_WHITE, dark ? 10 : 35), ba), Col(body, ba),
+                               gp::LinearGradientModeVertical);
+    g.FillPath(&fb, &p);
+    GdipSheen(g, rf, rad, dark ? 44 : 85);
+    GdipStrokeRound(g, pr, rad, dark ? C_WHITE : C_SPLIT, dark ? 40 : 130, 1.0f);
+    std::wstring txt = g_msgText.empty() ? L"(空消息)" : g_msgText;
+    auto lines = WrapText(g_tstDC, txt, (pr.right - pr.left) - S(36), 8);
+    int tot = (int)lines.size() * TextLineH();
+    int y = pr.top + ((pr.bottom - pr.top) - tot) / 2;
+    for (size_t i = 0; i < lines.size(); i++) {
+        RECT lr{ pr.left + S(18), y + (int)i * TextLineH(), pr.right - S(18),
+                 y + (int)(i + 1) * TextLineH() };
+        DrawTextRect(g_tstDC, lr, lines[i].c_str(), g_fUiB, dark ? C_WHITE : C_TEXT,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SdfAlpha((BYTE*)g_tstBits, g_tstW, g_tstH,                    // 圆角抗锯齿 + 软阴影
+             (float)m + (pr.right - pr.left) * 0.5f, (float)m + (pr.bottom - pr.top) * 0.5f,
+             (pr.right - pr.left) * 0.5f, (pr.bottom - pr.top) * 0.5f, rad, 110);
+}
+
+static void ToastCommit(BYTE alpha) {
+    BLENDFUNCTION bf{ AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA };
+    SIZE sz{ g_tstW, g_tstH };
+    POINT src{ 0, 0 }, dst{ g_tstX, g_tstY };
+    UpdateLayeredWindow(g_hToast, nullptr, &dst, &sz, g_tstDC, &src, 0, &bf, ULW_ALPHA);
+}
+
+static void ToastFadeIn() {
+    ShowWindow(g_hToast, SW_SHOWNOACTIVATE);
+    for (int i = 1; i <= 8; i++) { ToastCommit((BYTE)(255 * i / 8)); Sleep(120 / 8); }
+}
+
+static void ToastFadeOut(int ms) {
+    if (!IsWindowVisible(g_hToast)) return;
+    for (int i = 7; i >= 0; i--) { ToastCommit((BYTE)(255 * i / 8)); Sleep(ms / 8); }
+    ShowWindow(g_hToast, SW_HIDE);
+}
+
 static LRESULT CALLBACK ToastProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_ERASEBKGND: return 1;
-    case WM_SIZE: ApplyRoundRegion(h, true); return 0;
+    case WM_PAINT: { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); return 0; }   // ULW：无常规绘制
     case WM_LBUTTONDOWN:                                   // 主动点击：立即消失
         KillTimer(h, 1);
-        FadeOut(h, 120);
+        ToastFadeOut(120);
         return 0;
     case WM_SETCURSOR:
         SetCursor(LoadCursorW(nullptr, IDC_HAND));
         return TRUE;
-    case WM_PAINT: {
-        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
-        RECT rc; GetClientRect(h, &rc);
-        COLORREF bg = (g_theme == 0) ? RGB(255, 255, 255) : RGB(0, 0, 0);
-        COLORREF fg = (g_theme == 0) ? RGB(0, 0, 0) : RGB(255, 255, 255);
-        HBRUSH br = CreateSolidBrush(bg);
-        FillRect(dc, &rc, br);
-        DeleteObject(br);
-        std::wstring txt = g_msgText.empty() ? L"(空消息)" : g_msgText;
-        auto lines = WrapText(dc, txt, rc.right - S(36), 8);
-        int tot = (int)lines.size() * TextLineH();
-        int y = (rc.bottom - tot) / 2;
-        for (size_t i = 0; i < lines.size(); i++) {
-            RECT lr{ S(18), y + (int)i * TextLineH(), rc.right - S(18), y + (int)(i + 1) * TextLineH() };
-            DrawTextRect(dc, lr, lines[i].c_str(), g_fUiB, fg,
-                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-        EndPaint(h, &ps);
-        return 0;
-    }
     case WM_TIMER:
-        if (w == 1) { KillTimer(h, 1); FadeOut(h, 150); }
+        if (w == 1) { KillTimer(h, 1); ToastFadeOut(150); }
         return 0;
+    case WM_NCDESTROY: ToastFreeGfx(); return 0;
     }
     return DefWindowProcW(h, m, w, l);
 }
@@ -2359,13 +2489,13 @@ static void ShowToast(const std::wstring& text) {
         tc.hbrBackground = nullptr;                        // 同其他弹窗：防系统底色闪一帧
         tc.lpszClassName = TOAST_CLASS;
         RegisterClassW(&tc);
-        g_hToast = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, TOAST_CLASS, L"",
+        g_hToast = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST, TOAST_CLASS, L"",
                                    WS_POPUP, 0, 0, 1, 1, nullptr, nullptr, g_hInst, nullptr);
         if (!g_hToast) return;
-        EnableRoundedCorner(g_hToast, C_EDGE);
     }
     g_msgText = text;
-    // 尺寸随内容：按 3/5 屏宽折行（至多 8 行，超出省略号），宽取最长行，高随行数
+    // 尺寸随内容：按 3/5 屏宽折行（至多 8 行，超出省略号），宽取最长行，高随行数；
+    // 四周加阴影留白，玻璃体 + 软阴影一并画进 ULW 表面
     std::wstring txt = text.empty() ? L"(空消息)" : text;
     HDC dc = GetDC(nullptr);
     int maxTW = GetSystemMetrics(SM_CXSCREEN) * 3 / 5;
@@ -2379,11 +2509,12 @@ static void ShowToast(const std::wstring& text) {
     int w = lw + S(36);
     if (w < S(120)) w = S(120);
     int h = (int)lines.size() * TextLineH() + S(32);
-    int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;       // 主显示器正中
-    int y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
-    SetWindowPos(g_hToast, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
-    FadeIn(g_hToast, 120, SW_SHOWNOACTIVATE);
-    InvalidateRect(g_hToast, nullptr, FALSE);
+    int m = S(14);
+    g_tstW = w + m * 2; g_tstH = h + m * 2;
+    g_tstX = (GetSystemMetrics(SM_CXSCREEN) - g_tstW) / 2;   // 主显示器正中
+    g_tstY = (GetSystemMetrics(SM_CYSCREEN) - g_tstH) / 2;
+    ToastRender();
+    ToastFadeIn();
     if (g_toastSec > 0) SetTimer(g_hToast, 1, g_toastSec * 1000, nullptr);   // 新消息重置计时
     else KillTimer(g_hToast, 1);                           // 0 = 不自动消失，点击才关
 }
@@ -2444,11 +2575,12 @@ static LRESULT CALLBACK LstnProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         SelectObject(dc, g_fUi);
         return (LRESULT)g_brInset;     // 必须实心刷：HOLLOW 刷走 PatBlt 会整块变黑
     }
-    case WM_CTLCOLORSTATIC: {
+    case WM_CTLCOLORSTATIC: {                             // 玻璃渐变脸上：STATIC 透明融入
         HDC dc = (HDC)w;
-        SetBkColor(dc, C_CARD); SetTextColor(dc, C_TEXT);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, C_TEXT);
         SelectObject(dc, g_fUi);
-        return (LRESULT)g_brCard;
+        return (LRESULT)GetStockObject(NULL_BRUSH);
     }
     case WM_LBUTTONDOWN: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -2836,7 +2968,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         FreeMemDC();
         for (auto& kv : g_icons) if (kv.second) DestroyIcon(kv.second);
         FreeGdiRes();
-        DeleteObject(g_brBg); DeleteObject(g_brCard); DeleteObject(g_brInset);
+        DeleteObject(g_brInset);
         PostQuitMessage(0);
         return 0;
     }
